@@ -202,7 +202,7 @@ def _probe_stream_info(path: str) -> dict:
     ]
     logger.debug("Running ffprobe: %s", " ".join(cmd))
     try:
-        result = subprocess.run(
+        result = subprocess.run(  # nosec: command list constructed internally, no shell=True
             cmd,
             capture_output=True,
             text=True,
@@ -411,7 +411,7 @@ def _run_command(
     """
     logger.debug("Running command: %s", " ".join(cmd))
     try:
-        result = subprocess.run(
+        result = subprocess.run(  # nosec: command list constructed internally, no shell=True
             cmd,
             capture_output=True,
             text=True,
@@ -478,7 +478,7 @@ def _build_ffmpeg_merge_cmd(
     ext = _get_file_extension(output_path)
     if ext == ".mp4" and fast_start:
         cmd += ["-movflags", "+faststart"]
-    cmd += ["-strict", "experimental", output_path]
+    cmd += [output_path]
     return cmd
 
 
@@ -624,7 +624,6 @@ def _merge_basic(
 def _determine_output_path(
     output_path: Optional[str],
     video_path: str,
-    audio_path: str,
     output_ext: str,
 ) -> str:
     """Resolve the final output path, applying a default if needed.
@@ -632,7 +631,6 @@ def _determine_output_path(
     Args:
         output_path: User-supplied output path (may be ``None``).
         video_path: Path to the video input file.
-        audio_path: Path to the audio input file.
         output_ext: Desired output extension.
 
     Returns:
@@ -643,8 +641,8 @@ def _determine_output_path(
         if not candidate.lower().endswith(output_ext):
             candidate = str(Path(candidate).with_suffix(output_ext))
         return os.path.abspath(candidate)
-    base = Path(video_path).stem
-    return os.path.abspath(str(Path(base + "_merged" + output_ext)))
+    video_p = Path(video_path)
+    return os.path.abspath(str(video_p.with_name(video_p.stem + "_merged" + output_ext)))
 
 
 def _cleanup_temp_files(*paths: str) -> None:
@@ -708,7 +706,7 @@ def merge_audio_video(
         _get_file_extension(output_path) if output_path else "",
     )
     resolved_output = _determine_output_path(
-        output_path, video_path, audio_path, output_ext
+        output_path, video_path, output_ext
     )
     output_dir = os.path.dirname(resolved_output)
     if output_dir:
@@ -717,10 +715,7 @@ def merge_audio_video(
     try:
         if _check_ffmpeg():
             logger.info("ffmpeg is available; using ffmpeg merge path.")
-            result = _merge_with_ffmpeg(video_path, audio_path, resolved_output)
-            if result != resolved_output:
-                temp_files.append(result)
-            return resolved_output
+            return _merge_with_ffmpeg(video_path, audio_path, resolved_output)
         logger.warning(
             "ffmpeg is not available. Falling back to basic merge."
         )
