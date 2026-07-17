@@ -60,6 +60,10 @@ def extract_video_id(url: str) -> str | None:
     v = params.get("v")
     if v:
         return v[0]
+    if parsed.netloc in ("youtu.be", "www.youtu.be"):
+        path_id = parsed.path.lstrip("/")
+        if path_id:
+            return path_id
     match = re.search(r"/(?:embed|v|shorts|live)/([A-Za-z0-9_-]{11})", url)
     if match:
         return match.group(1)
