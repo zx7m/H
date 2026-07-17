@@ -11,8 +11,7 @@ from __future__ import annotations
 import os
 import shutil
 import sys
-from pathlib import Path
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, Dict
 
 from .metadata import get_video_info
 from .utils import is_valid_youtube_url, normalize_youtube_url
@@ -22,7 +21,6 @@ from .http_downloader import (
     download_audio_from_info,
     download_video_from_info,
 )
-from .stream_resolver import parse_streaming_data, resolve_streams
 
 _HAS_FFMPEG = shutil.which("ffmpeg") is not None
 
