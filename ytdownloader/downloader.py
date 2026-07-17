@@ -13,8 +13,7 @@ import re
 import shutil
 import sys
 import time
-from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple, Union
+from typing import Any, Dict, List, Optional, Tuple
 
 import requests
 
@@ -35,82 +34,13 @@ def _safe_int(value: Any) -> Optional[int]:
         return None
 
 
-def _parse_stream(fmt: Dict[str, Any]) -> Dict[str, Any]:
-    """Normalize a raw format dict from streamingData into a stream descriptor."""
-    from .stream_resolver import _safe_int as _sr_safe_int
-
-    height = _sr_safe_int(fmt.get("height"))
-    abr = _sr_safe_int(fmt.get("abr"))
-    tbr = _sr_safe_int(fmt.get("tbr"))
-    vbr = _sr_safe_int(fmt.get("vbr"))
-    content_length = _sr_safe_int(fmt.get("contentLength"))
-
-    mime = (fmt.get("mimeType") or "").split(";")[0].strip().lower()
-    ext = fmt.get("ext") or _guess_ext(mime)
-
-    vcodec = fmt.get("vcodec") or ""
-    acodec = fmt.get("acodec") or ""
-    has_video = vcodec not in ("none", "")
-    has_audio = acodec not in ("none", "")
-
-    return {
-        "itag": _sr_safe_int(fmt.get("itag")),
-        "mime_type": mime,
-        "vcodec": vcodec,
-        "acodec": acodec,
-        "width": _sr_safe_int(fmt.get("width")),
-        "height": height,
-        "fps": _sr_safe_int(fmt.get("fps")),
-        "tbr": tbr,
-        "abr": abr,
-        "vbr": vbr,
-        "bitrate": tbr if tbr else (vbr if vbr else abr),
-        "content_length": content_length,
-        "approx_duration_ms": _sr_safe_int(fmt.get("approxDurationMs")),
-        "is_dash": fmt.get("type") == "FORMAT_DASH",
-        "is_hls": fmt.get("type") == "FORMAT_STREAMTYPE_HLS",
-        "protocol": fmt.get("protocol", "http"),
-        "url": fmt.get("url"),
-        "signature_cipher": fmt.get("signatureCipher"),
-        "quality_label": fmt.get("qualityLabel"),
-        "quality": height if height else (abr if abr else (tbr if tbr else 0)),
-        "ext": ext,
-        "has_video": has_video,
-        "has_audio": has_audio,
-    }
-
-
-def _guess_ext(mime: str) -> str:
-    """Guess file extension from a MIME type."""
-    if not mime:
-        return "mp4"
-    if "webm" in mime:
-        return "webm"
-    if "mp4" in mime:
-        return "mp4"
-    if "audio" in mime:
-        return "m4a"
-    return "mp4"
-
-
-def _resolve_stream_url(fmt: Dict[str, Any]) -> Optional[str]:
-    """Resolve a direct URL from a format dict, handling signatureCipher."""
-    from .stream_resolver import _resolve_cipher_url
-
-    url = fmt.get("url")
-    if url:
-        return str(url)
-    cipher = fmt.get("signatureCipher")
-    if cipher:
-        try:
-            return _resolve_cipher_url(str(cipher))
-        except StreamResolutionError:
-            return None
-    return None
-
-
-def select_format(streams: List[Dict[str, Any]], quality: Optional[str] = None) -> Dict[str, Any]:
-    """Select the best stream matching the requested quality constraint.
+def select_format(
+    streams: List[Dict[str, Any]],
+    quality: str = "best",
+    allow_audio_only: bool = False,
+    allow_video_only: bool = False,
+) -> Dict[str, Any]:
+    """Select the best stream matching the requested quality and category constraints.
 
     Args:
         streams: A list of stream dicts as returned by ``resolve_streams``.
@@ -118,29 +48,46 @@ def select_format(streams: List[Dict[str, Any]], quality: Optional[str] = None) 
             ``'720p'``, ``'1080p'``, etc.  When a resolution is given the
             highest-quality stream whose ``height`` is **at or below** the
             target is returned.
+        allow_audio_only: When ``False`` (default), audio-only streams
+            (``vcodec == 'none'``) are excluded from selection.
+        allow_video_only: When ``False`` (default), video-only streams
+            (``acodec == 'none'``) are excluded from selection.
 
     Returns:
         The best matching stream dict.
 
     Raises:
-        ValueError: If no streams are provided or no stream matches the
+        ValueError: If no streams are provided, no stream matches the
+            requested category constraints, or no stream matches the
             requested quality constraint.
     """
     if not streams:
         raise ValueError("No streams available to select from.")
 
+    filtered = list(streams)
+    if not allow_audio_only:
+        filtered = [s for s in filtered if s.get("has_video")]
+    if not allow_video_only:
+        filtered = [s for s in filtered if s.get("has_audio")]
+
+    if not filtered:
+        raise ValueError(
+            "No streams match the requested category constraints. "
+            "Try setting allow_audio_only=True or allow_video_only=True."
+        )
+
     quality = (quality or "best").strip().lower()
 
     if quality == "best":
-        best = max(streams, key=_stream_sort_key)
+        best = max(filtered, key=_stream_sort_key)
         return best
 
     target_height = _parse_quality_to_height(quality)
     if target_height is None:
-        best = max(streams, key=_stream_sort_key)
+        best = max(filtered, key=_stream_sort_key)
         return best
 
-    candidates = [s for s in streams if _stream_sort_key(s)[1] <= target_height]
+    candidates = [s for s in filtered if _stream_sort_key(s)[1] <= target_height]
     if not candidates:
         raise ValueError(
             f"No stream found with height <= {target_height}p. "
@@ -210,18 +157,6 @@ def _build_output_filename(
     safe_title = re.sub(r'[\\/:*?"<>|\x00-\x1f]', "_", title).strip() or "Unknown"
     filename = f"{safe_title} [{video_id}].{ext}"
     return os.path.join(output_dir, filename)
-
-
-def _get_stream_ranges(total_size: int) -> List[Tuple[int, int]]:
-    """Split total_size into 1 MB chunks represented as (start, end) byte ranges."""
-    chunk_size = 1024 * 1024
-    ranges = []
-    offset = 0
-    while offset < total_size:
-        end = min(offset + chunk_size - 1, total_size - 1)
-        ranges.append((offset, end))
-        offset = end + 1
-    return ranges
 
 
 def _download_stream(
@@ -416,7 +351,7 @@ def download_video(
 
     stream = select_format(video_streams, quality="best")
     output_file = _build_output_filename(info, stream, output_path)
-    stream_url = _resolve_stream_url(stream)
+    stream_url = stream.get("url")
 
     if not stream_url:
         raise StreamResolutionError(
@@ -478,7 +413,7 @@ def download_audio(
     if _HAS_FFMPEG and not output_file.endswith(".mp3"):
         output_file = os.path.splitext(output_file)[0] + ".mp3"
 
-    stream_url = _resolve_stream_url(stream)
+    stream_url = stream.get("url")
 
     if not stream_url:
         raise StreamResolutionError(
