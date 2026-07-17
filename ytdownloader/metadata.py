@@ -204,6 +204,7 @@ def get_video_info(url: str) -> Dict[str, Any]:
     result: Dict[str, Any] = {
         "videoDetails": video_details,
         "streamingData": streaming_data,
+        "streaming_data": streaming_data,
         "player_response": player_data,
         "id": video_details.get("videoId"),
         "title": video_details.get("title"),
