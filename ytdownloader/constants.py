@@ -1067,17 +1067,17 @@ AUDIO_ONLY_ITAGS: List[int] = [
 # Format string constants
 # ---------------------------------------------------------------------------
 
-#: yt-dlp format string template for best combined audio+video.
-FORMAT_BEST_COMBINED: str = "bestvideo+bestaudio/best"
+#: Default format selector for best combined audio+video (progressive or DASH merge).
+FORMAT_BEST_COMBINED: str = "best_combined"
 
-#: yt-dlp format string template for best audio only.
-FORMAT_BEST_AUDIO: str = "bestaudio/best"
+#: Default format selector for best audio only.
+FORMAT_BEST_AUDIO: str = "best_audio"
 
-#: yt-dlp format string template for best mp4 video.
-FORMAT_BEST_MP4: str = "best[ext=mp4]/best"
+#: Default format selector for best MP4 video.
+FORMAT_BEST_MP4: str = "best_mp4"
 
-#: Output filename template used by yt-dlp.
-OUTPUT_TEMPLATE: str = "%(title)s [%(id)s].%(ext)s"
+#: Output filename template. Placeholders: {title}, {video_id}, {ext}
+OUTPUT_TEMPLATE: str = "{title}_{video_id}.{ext}"
 
 
 # ---------------------------------------------------------------------------

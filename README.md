@@ -62,18 +62,24 @@ python -m ytdownloader --output ./downloads "https://www.youtube.com/watch?v=dQw
 
 ```
 ytdownloader/
-  __init__.py      - Package exports
-  cli.py           - CLI entry point (argparse)
-  downloader.py    - Core download logic (yt-dlp wrapper)
-  metadata.py      - Metadata extraction from ytInitialPlayerResponse
-  utils.py         - URL parsing and validation
+  __init__.py          - Package exports
+  cli.py               - CLI entry point (argparse)
+  http_downloader.py   - Chunked HTTP streaming download with resume support
+  stream_resolver.py   - Parses ytInitialPlayerResponse, resolves best format
+  n_resolver.py        - Resolves YouTube n-parameter for throttled streams
+  cipher.py            - Deciphers signature-cipher URLs
+  downloader.py        - Orchestrates stream resolution and download pipeline
+  metadata.py          - Fetches watch page and extracts ytInitialPlayerResponse
+  utils.py             - URL parsing and validation
 ```
 
 ### How it works
 
 1. **URL Parsing** (`utils.py`): Validates and normalizes YouTube URLs, extracting the video ID.
 2. **Metadata Extraction** (`metadata.py`): Fetches the YouTube watch page HTML and extracts the embedded `ytInitialPlayerResponse` JSON object. This contains all video metadata, available formats, and stream URLs.
-3. **Download** (`downloader.py`): Uses `yt-dlp` to handle the complex format negotiation, stream URL resolution, and multi-format merging.
+3. **Stream Resolution** (`stream_resolver.py`): Parses `ytInitialPlayerResponse` to build `StreamFormat` objects, resolves DASH/progressive formats, and selects the best quality match.
+4. **Cipher & n-parameter** (`cipher.py`, `n_resolver.py`): Handles signature-cipher URLs and resolves the n-parameter required for throttled stream URLs.
+5. **Download** (`http_downloader.py`): Downloads selected streams via chunked HTTP requests with resume support and progress callbacks.
 
 ## Error Handling
 
@@ -88,5 +94,4 @@ The tool handles common error scenarios gracefully:
 ## Requirements
 
 - Python 3.9+
-- yt-dlp
 - requests
