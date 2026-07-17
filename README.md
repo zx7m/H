@@ -3,7 +3,8 @@
 **A 100% from-scratch Python YouTube video downloader** that reverse-engineers
 YouTube's video delivery pipeline to extract and download video and audio streams
 directly. Every component is built from first principles using only the Python
-standard library and `requests`.
+standard library and `requests`. No `yt-dlp`, no `youtube-dl` — full control,
+full transparency.
 
 ---
 
@@ -205,7 +206,7 @@ python -m ytdownloader --info "https://www.youtube.com/watch?v=dQw4w9WgXcQ"
 Sample output:
 
 ```
-================================================================
+===============================================================
   Title:        Never Gonna Give You Up
   Video ID:     dQw4w9WgXcQ
   Author:       Rick Astley
@@ -215,7 +216,7 @@ Sample output:
   Views:        1,400,000,000+
   Live:         No
   Private:      No
-================================================================
+===============================================================
   Keywords:     rick astley, never gonna give you up, ...
   Thumbnail:    https://i.ytimg.com/vi/dQw4w9WgXcQ/maxresdefault.jpg
 
@@ -384,10 +385,11 @@ implemented in a dedicated module with a single, well-defined responsibility.
        │
        ▼
   ┌──────────┐     ┌────────────┐     ┌─────────────────┐     ┌─────────────────┐
-  │  cli.py  │────▶│  utils.py  │────▶│   cache.py      │────▶│  metadata.py    │
-  │ argparse │     │ URL normal │     │ SHA-256 keyed   │     │ HTML fetch +    │
-  │ ANSI out │     │ + validate │     │ file cache + TTL│     │ JSON extraction │
-  └──────────┘     └────────────┘     └─────────────────┘     └─────────────────┘
+  │  cli.py  │────▶│  utils.py  │────▶│   cache.py      │────▶│  html_extractor │
+  │ argparse │     │ URL normal │     │ SHA-256 keyed   │     │ DOM parsing +   │
+  │ ANSI out │     │ + validate │     │ file cache + TTL│     │ ytInitialPlayer  │
+  └──────────┘     └────────────┘     └─────────────────┘     │ Response extract │
+       │                  │                   │                └─────────────────┘
        │                  │                   │                       │
        │                  │                   │                       ▼
        │                  │                   │            ┌────────────────────┐
@@ -398,18 +400,25 @@ implemented in a dedicated module with a single, well-defined responsibility.
        │                  │                   │                       │
        │                  ▼                   ▼                       ▼
        │            ┌──────────┐     ┌─────────────────┐     ┌─────────────────┐
-       │            │ logger.py│     │  exceptions.py  │     │  downloader.py  │
-       │            │ coloured │     │ 15 error classes│     │ stream select +  │
-       │            │ logging  │     │                 │     │ chunked download │
+       │            │ logger.py│     │  exceptions.py  │     │ player_response  │
+       │            │ coloured │     │ 15 error classes│     │ parser + validator│
+       │            │ logging  │     │                 │     │                  │
        │            └──────────┘     └─────────────────┘     └─────────────────┘
        │                                                                   │
        └───────────────────────────────────────────────────────────────────┘
                                      │
                                      ▼
-                              ┌──────────────┐
-                              │  output file  │
-                              │  on disk      │
-                              └──────────────┘
+       ┌─────────────┐     ┌──────────────────┐     ┌─────────────────┐
+       │ http_client │────▶│ download_manager │────▶│  output file    │
+       │ requests    │     │ chunked streaming │     │  on disk        │
+       │ session     │     │ with resume      │     │                 │
+       └─────────────┘     └──────────────────┘     └─────────────────┘
+            │                       │
+            ▼                       ▼
+       ┌─────────────┐     ┌──────────────────┐
+       │ url_builder │     │   progress.py    │
+       │ signed URLs │     │ progress display │
+       └─────────────┘     └──────────────────┘
 ```
 
 **Stage 1 — URL Parsing** (`utils.py`)
@@ -442,15 +451,14 @@ and 86400 seconds (24 hours). Expired entries are automatically evicted on
 read. Writes use an atomic temp-file-then-rename pattern to prevent corruption
 from interrupted writes.
 
-**Stage 3 — HTML Fetch & Extraction** (`metadata.py`)
+**Stage 3 — HTML Fetch & Extraction** (`html_extractor.py`)
 
-On a cache miss, `_fetch_page()` issues a `GET` request to the YouTube watch
+On a cache miss, `http_client.py` issues a `GET` request to the YouTube watch
 page with desktop-class headers (`User-Agent`, `Accept`, `Accept-Language`).
-The raw HTML response is scanned by `_extract_initial_player_response()` which
-uses a regex to locate the `ytInitialPlayerResponse = {...}` block, then a
-hand-written brace-depth scanner (`_extract_json_object`) to extract the
-complete JSON object — correctly handling nested braces, escaped strings, and
-multiline content.
+The raw HTML response is scanned by `extract_player_response()` which uses a
+regex to locate the `ytInitialPlayerResponse = {...}` block, then a hand-written
+brace-depth scanner to extract the complete JSON object — correctly handling
+nested braces, escaped strings, and multiline content.
 
 The extracted JSON is deserialised with `json.loads()`. The
 `playabilityStatus` field is then examined:
@@ -461,59 +469,78 @@ The extracted JSON is deserialised with `json.loads()`. The
 - `AGE_CHECK_REQUIRED` / `AGE_CHECK_NOT_ALLOWED` — age-restricted
 - `ERROR` / `AGE_RESTRICTED` — generic playback error
 
-On success, `get_video_info()` returns a dictionary containing all video
-details, streaming data, thumbnail URLs, and available formats.
+On success, the data is passed to `player_response.py` for structured parsing.
 
-**Stage 4 — Stream Selection** (`downloader.py`)
+**Stage 4 — Response Parsing** (`player_response.py` → `metadata_extractor.py`)
+
+`player_response.py` validates the raw `ytInitialPlayerResponse` structure and
+extracts all nested data: video details, streaming data (formats + adaptive
+formats), microformat player info, captions, engagement panels, thumbnails,
+and playability status. It delegates to `metadata_extractor.py` for field-level
+extraction and formatting (duration, view count, upload date, description,
+keywords, etc.).
+
+**Stage 5 — Stream Selection & URL Resolution** (`streaming_data.py` →
+`format_selector.py` → `url_builder.py`)
 
 The `streamingData` object contains two lists: `formats` (combined audio+video
 progressive streams) and `adaptiveFormats` (separate DASH audio and video
-streams). `constants.py` provides a comprehensive itag database mapping every
-known itag to its quality label, container format, video codec, audio codec,
-and protocol.
+streams). `streaming_data.py` parses every format dict into a `StreamFormat`
+dataclass with typed fields for itag, ext, codecs, resolution, bitrate,
+container, protocol, content length, and more.
 
-The downloader applies the user's quality selection by filtering `adaptiveFormats`
-on `height`. It prefers progressive (combined) formats over DASH to avoid
+`format_selector.py` applies the user's quality selection by filtering on
+resolution, preferring progressive (combined) formats over DASH to avoid
 requiring a merge step. When `--audio` is specified, only audio-only formats
-(identified by `acodec != "none"` and `vcodec == "none"`) are considered.
+are considered.
 
-**Stage 5 — Chunked Download**
+`url_builder.py` reconstructs valid download URLs from base URLs, signature
+cipher parameters, and the `n`-parameter. `signature_cipher.py` decodes the
+`signatureCipher` URL parameter. `n_resolver.py` resolves the JavaScript
+`n`-parameter by fetching the YouTube player JS and computing the transform
+function in pure Python.
+
+**Stage 6 — Chunked Download & Post-Processing** (`http_client.py` →
+`download_manager.py` → `progress.py` → `merger.py`)
 
 Streams are downloaded using `requests.get(url, stream=True)` with a 1 MB
-chunk size. A progress callback is invoked after each chunk, reporting:
+chunk size. `progress.py` renders a live progress bar (percentage, speed, ETA)
+using ANSI escape sequences. The `--resume` flag checks for an existing partial
+file, determines its size, and adds a `Range: bytes=<offset>-` header.
 
-- Total bytes downloaded
-- Total expected size (when available from `contentLength`)
-- Instantaneous speed (bytes per second, calculated from time delta)
-- Percentage complete and ETA
-
-The `--resume` flag checks for an existing partial file, determines its size,
-and adds a `Range: bytes=<offset>-` header to the request. On completion, the
-file size is verified against the expected `contentLength` when available.
-
-**Stage 6 — Post-Processing**
-
-Audio-only downloads are written as raw WebM/Opus or M4A/AAC files depending on
-the selected itag. When the output format is MP3 and `ffmpeg` is available on
-the system path, the downloader can optionally invoke it for transcoding.
-Subtitles are downloaded as raw XML or JSON3, parsed into cue objects, and
-written as standard SRT files with sequential indices and `HH:MM:SS,mmm`
-timestamps.
+When separate audio+video DASH streams are downloaded, `merger.py` combines
+them using `ffmpeg` if available, or a basic stream copy fallback. Subtitles
+are downloaded as raw XML or JSON3, parsed into cue objects, and written as
+standard SRT files.
 
 ### Module Reference
 
 | Module | Purpose | Key Exports |
 |--------|---------|-------------|
-| `__init__.py` | Package initialisation. Exposes public API, sets `__version__ = "1.0.0"`. | `download_video`, `download_audio`, `get_video_info`, `VideoInfo`, `StreamFormat`, exception classes, `YTConfig`, `get_logger`, `setup_logging` |
+| `__init__.py` | Package initialisation. Exposes public API, sets `__version__ = "2.0.0"`. | `download_video`, `download_audio`, `get_video_info`, `VideoInfo`, `StreamFormat`, exception classes, `YTConfig`, `get_logger`, `setup_logging` |
 | `__main__.py` | Enables `python -m ytdownloader` invocation. Delegates to `cli.main()`. | `main` |
 | `cli.py` | Full-featured CLI built on `argparse`. Handles argument parsing, ANSI colour helpers, format table rendering, config file loading, and dispatch to download / info / list-format handlers. | `main()`, `_build_parser()`, `_print_video_info()`, `_validate_args()` |
-| `downloader.py` | Core download engine. Wraps the stream extraction and download process. Uses yt-dlp's core for stream resolution and download execution. Handles format selection, metadata printing, and file path computation. | `download_video()`, `download_audio()`, `get_video_info()`, `print_video_info()` |
-| `metadata.py` | HTML extraction layer. Fetches the YouTube watch page, locates the `ytInitialPlayerResponse` JavaScript object using a brace-depth scanner, and deserialises it. Detects playability errors (age-gate, geo-restriction, private). | `get_video_info()`, `_fetch_page()`, `_extract_initial_player_response()` |
+| `config.py` | YTConfig dataclass with load/save for YAML/JSON, default config factory, environment variable overrides for `YT_*` env vars, and full validation raising `ConfigError`. | `YTConfig`, `load_config()`, `save_config()`, `get_default_config()`, `apply_env_overrides()` |
 | `utils.py` | URL utilities. Validates YouTube URLs against known domain and path patterns, normalises short URLs (`youtu.be`) and path-based URLs (`/shorts/`, `/live/`) to the canonical `watch?v=` form, and extracts the 11-character video ID. | `is_valid_youtube_url()`, `normalize_youtube_url()`, `extract_video_id()` |
-| `exceptions.py` | Exception hierarchy. `YTDLException` is the base; 14 specific subclasses cover every failure mode from invalid URLs to cache corruption. All carry an optional `cause` chain. | `YTDLException`, `InvalidURLError`, `VideoUnavailableError`, `AgeRestrictedError`, `GeoRestrictedError`, `NetworkError`, `DownloadError`, `FormatSelectionError`, `SignatureCipherError`, `NResolverError`, `MetadataExtractionError`, `StreamResolutionError`, `SubtitleError`, `MergeError`, `CacheError`, `ConfigError` |
+| `exceptions.py` | Exception hierarchy. `YTDLException` is the base; 15 specific subclasses cover every failure mode from invalid URLs to cache corruption. All carry an optional `cause` chain. | `YTDLException`, `InvalidURLError`, `VideoUnavailableError`, `AgeRestrictedError`, `GeoRestrictedError`, `NetworkError`, `DownloadError`, `FormatSelectionError`, `SignatureCipherError`, `NResolverError`, `MetadataExtractionError`, `StreamResolutionError`, `SubtitleError`, `MergeError`, `CacheError`, `ConfigError` |
 | `logger.py` | Coloured structured logging. `YTLogger` wraps `logging.Logger` with ANSI colour support (via `colorama` on Windows), a `_ColorFormatter` that colour-codes by level, and convenience helpers (`log_download_start`, `log_download_progress`, `log_download_complete`, `log_format_found`, etc.). Supports optional file handler via `YT_LOG_FILE`. | `YTLogger`, `get_logger()`, `_configure_logging()`, `debug_log_request()`, `debug_log_response()`, `log_download_start()`, `log_download_progress()`, `log_download_complete()` |
 | `cache.py` | File-system cache with TTL. `CacheManager` stores entries as individual JSON files in `.ytcache/` (configurable). Keys are SHA-256 hashed. Supports `get`, `set`, `delete`, `clear`, `has`, `keys`, `items`, `size`, and `__len__` / `__contains__`. Atomic writes via temp file + rename. | `CacheManager` |
 | `constants.py` | YouTube-specific constant database. Over 600 itag definitions mapping itag numbers to quality labels, MIME types, codecs, and protocols. Includes MIME-to-extension maps, codec preference lists, URL templates, regex patterns for HTML extraction, and cache / logging defaults. | `ITAG_QUALITY`, `ITAG_DETAILS`, `MIME_EXT_MAP`, `VIDEO_CODECS`, `AUDIO_CODECS`, `CONTAINERS`, `PROTOCOLS`, `QUALITY_HEIGHT_MAP`, `RE_PLAYER_RESPONSE`, `RE_YTCFG`, `RE_STS`, `YOUTUBE_WATCH_URL_FORMAT`, `DEFAULT_CACHE_TTL`, and more |
+| `http_client.py` | Custom HTTP client built from `requests`. `HttpClient` class with automatic retry and exponential backoff, session management with headers and cookies, proxy support, cookie jar loading from Netscape format, debug logging for requests/responses, stream download with progress callback, `HEAD` request support for file size checks. | `HttpClient`, `HttpClientError` |
+| `html_extractor.py` | HTML parser to extract `ytInitialPlayerResponse` from YouTube watch page. Uses regex to find the JS object, handles escaped unicode and nested JSON. Also extracts `ytcfg` for API keys, `sts` token, `ytInitialData`, video ID from meta tags, and detects age/geo restrictions. | `extract_player_response()`, `extract_ytcfg()`, `extract_sts()`, `extract_initial_data()`, `find_video_id_from_html()`, `is_age_gated()`, `is_geo_restricted()`, `HtmlExtractionError` |
+| `player_response.py` | Comprehensive parser for the full `ytInitialPlayerResponse` object structure. Extracts video details, streaming data, microformat player info, playability status, captions, audio tracks, thumbnail URLs, engagement panels, endscreen, and cards. Validates structure and provides safe nested dict access helpers. | `parse_player_response()`, `extract_video_details()`, `extract_streaming_data()`, `extract_microformat()`, `extract_playability_status()`, `extract_captions()`, `extract_audio_tracks()`, `extract_thumbnail_urls()`, `validate_player_response()`, `is_live_stream()`, `is_age_restricted()`, `get_recommended_url()` |
+| `streaming_data.py` | Comprehensive streaming data parser. `StreamFormat` dataclass with fields for itag, ext, codecs, resolution, bitrate, container, protocol, content length, and more. Provides parsing, filtering, sorting, and selection utilities for format lists. | `StreamFormat`, `parse_streaming_data()`, `parse_single_format()`, `filter_formats()`, `sort_formats()`, `get_best_format()`, `get_format_by_itag()`, `get_audio_only_formats()`, `get_video_only_formats()`, `get_combined_formats()`, `StreamDataError` |
+| `signature_cipher.py` | Signature cipher decoder. Parses the `signatureCipher` URL parameter (`s=XXX&sp=XXX&url=XXX&n=XXX`), decodes URL-encoded components, and reconstructs signed download URLs. | `decode_signature_cipher()`, `apply_signature()`, `parse_cipher_params()`, `SignatureCipherError` |
+| `n_resolver.py` | JavaScript `n`-parameter resolver. Fetches the YouTube player JS, extracts the n-function by name, and computes the n-transformed string in pure Python. Supports reversal, swap, splice, and other transform patterns. | `NResolver`, `resolve_n()`, `_fetch_player_js()`, `_extract_function()`, `_compute_n()`, `NResolverError` |
+| `url_builder.py` | Stream URL builder. Constructs complete download URLs from base URLs, signature cipher parameters, n-parameter values, and extra query parameters. Validates and sanitises URLs. | `build_stream_url()`, `build_dash_stream_url()`, `build_hls_stream_url()`, `append_url_params()`, `sanitize_url()`, `validate_stream_url()`, `is_youtube_stream_url()`, `extract_host()`, `StreamURLError` |
+| `format_selector.py` | Smart format selection engine. Selects the best format by quality string or itag, preferring combined audio+video formats over separate DASH streams. Handles fallback chains and detailed selection reasoning. | `select_format()`, `_select_by_quality()`, `_select_best_combined()`, `_select_best_video()`, `_select_best_audio()`, `_fallback_chain()`, `list_available_formats()`, `FormatSelectionError` |
+| `progress.py` | Custom progress bar display. Renders live progress bars with ANSI colours showing percentage, downloaded/total size, speed, and ETA. Supports unknown total size, fast/slow network changes, and multiple simultaneous downloads. | `ProgressBar`, `SilentProgress`, `MultiProgress` |
+| `download_manager.py` | Core download manager with chunked streaming and resume support. Downloads streams using `requests.get(stream=True)`, supports HTTP `Range` requests for resume, calculates speed and ETA, verifies file sizes, and handles connection drops with retry. | `DownloadManager`, `download_stream()`, `download_audio()`, `download_video()`, `DownloadProgress`, `DownloadError` |
+| `metadata_extractor.py` | Comprehensive video metadata extractor. Extracts title, author, channel ID, duration, view count, like count, upload date, description, thumbnail URLs, keywords, categories, live/private status, and formats them for display. | `extract_metadata()`, `extract_title()`, `extract_author()`, `extract_channel_id()`, `extract_duration()`, `extract_view_count()`, `extract_upload_date()`, `extract_description()`, `extract_thumbnail_urls()`, `extract_keywords()`, `extract_categories()`, `format_duration()`, `format_view_count()`, `format_upload_date()`, `MetadataExtractionError` |
+| `subtitle_parser.py` | Subtitle/closed-caption parser. Downloads caption tracks, parses YouTube XML and JSON3 caption formats, converts to standard SRT with sequential indices and `HH:MM:SS,mmm` timestamps. Supports both auto-generated and manual captions. | `SubtitleTrack`, `parse_caption_tracks()`, `get_caption_tracks()`, `download_subtitle()`, `_convert_xml_to_srt()`, `_convert_json3_to_srt()`, `_format_srt_time()`, `SubtitleError` |
+| `merger.py` | Audio/video stream merger. Merges separate audio and video streams using `ffmpeg` if available, or falls back to basic stream copy. Validates input files, cleans up temp files, and handles codec compatibility. | `merge_audio_video()`, `_merge_with_ffmpeg()`, `_merge_basic()`, `_check_ffmpeg()`, `get_ffmpeg_path()`, `MergeError` |
+| `video_info.py` | Main `VideoInfo` data class. Ties together video metadata, streaming data, formats, captions, and playability status. Provides convenience methods for selecting best formats, audio-only, video-only, thumbnails, and serialisation. | `VideoInfo`, `from_player_response()`, `get_best_format()`, `get_audio_only()`, `get_video_only()`, `get_thumbnail_url()`, `has_captions()`, `is_live()`, `is_playable()`, `to_dict()` |
+| `downloader.py` | Core download engine. Orchestrates the full download pipeline: fetch video info, select format, resolve stream URL, download chunks, merge audio+video if needed, handle subtitles, and verify output. Uses only our own modules — no yt-dlp. | `download_video()`, `download_audio()`, `get_video_info()`, `print_video_info()` |
 
 ---
 
@@ -817,13 +844,27 @@ ytdownloader/
   __init__.py         Package exports and version
   __main__.py         python -m ytdownloader entry point
   cli.py              CLI: argparse, ANSI output, format tables, dispatch
-  downloader.py       Core download engine (yt-dlp based)
-  metadata.py         HTML extraction: ytInitialPlayerResponse parser
+  config.py           YTConfig dataclass, load/save YAML/JSON config
   utils.py            URL validation, normalisation, video ID extraction
-  exceptions.py       15 custom exception classes
+  exceptions.py       15+ custom exception classes
   logger.py           Coloured structured logging with YTLogger wrapper
   cache.py            File-system cache with TTL (SHA-256 keys)
   constants.py        itag database, MIME maps, codec lists, URL templates
+  http_client.py      HTTP client: retry, cookies, proxy, debug logging
+  html_extractor.py   DOM/HTML parsing, ytInitialPlayerResponse extraction
+  player_response.py  Full ytInitialPlayerResponse parser and validator
+  streaming_data.py   StreamFormat dataclass and format utilities
+  signature_cipher.py Decode signatureCipher URL parameters
+  n_resolver.py       JS n-parameter traversal and resolution
+  url_builder.py      Construct valid signed stream URLs
+  format_selector.py  Smart quality selection logic
+  progress.py         Custom progress bar display (ANSI colours)
+  download_manager.py Chunked streaming download with resume support
+  metadata_extractor.py Video metadata field extraction and formatting
+  subtitle_parser.py  Caption track parsing and SRT conversion
+  merger.py           Audio/video stream merging (ffmpeg fallback)
+  video_info.py       Main VideoInfo data class
+  downloader.py       Core download engine (from-scratch, no yt-dlp)
 
 tests/
   test_cli.py
