@@ -153,11 +153,9 @@ class ProgressBar:
         with self._lock:
             if self._finished:
                 return
-            old_downloaded = self._downloaded
-            self._downloaded = max(self._downloaded, downloaded_bytes)
-            delta = self._downloaded - old_downloaded
-            if delta > 0:
-                self._speed_tracker.record(float(delta))
+            self._downloaded += downloaded_bytes
+            if downloaded_bytes > 0:
+                self._speed_tracker.record(float(downloaded_bytes))
 
     def _record_delta(self, new_downloaded: int) -> None:
         """Record the delta between the current and previous downloaded count.
@@ -196,20 +194,7 @@ class ProgressBar:
         Returns:
             A string such as ``"01:23"``, ``"?:??"``, or ``"unknown"``.
         """
-        if seconds is None or seconds < 0 or not _isfinite(seconds):
-            return "?:??"
-        if seconds > 86399:
-            hours = int(seconds // 3600)
-            minutes = int((seconds % 3600) // 60)
-            return f"{hours:d}:{minutes:02d}:00"
-        if seconds > 3599:
-            hours = int(seconds // 3600)
-            minutes = int((seconds % 3600) // 60)
-            secs = int(seconds % 60)
-            return f"{hours:d}:{minutes:02d}:{secs:02d}"
-        minutes = int(seconds // 60)
-        secs = int(seconds % 60)
-        return f"{minutes:d}:{secs:02d}"
+        return _format_eta_internal(seconds)
 
     def _format_size(self, num_bytes: int | None) -> str:
         """Format a byte count as a human-readable string.
@@ -441,9 +426,9 @@ class SilentProgress:
         """No-op update.
 
         Args:
-            downloaded_bytes: Ignored.
+            downloaded_bytes: Number of additional bytes to record.
         """
-        self._downloaded = max(self._downloaded, downloaded_bytes)
+        self._downloaded += downloaded_bytes
 
     def finish(self) -> None:
         """No-op finish."""
@@ -601,8 +586,8 @@ class MultiProgress:
         desc: str = "Downloading",
         unit: str = "B",
         unit_scale: bool = True,
-        bar_class: type[ProgressBar] = ProgressBar,
-    ) -> ProgressBar:
+        bar_class: type[ProgressBar | SilentProgress] = ProgressBar,
+    ) -> ProgressBar | SilentProgress:
         """Create and register a new progress bar.
 
         Args:
@@ -622,7 +607,7 @@ class MultiProgress:
             self._entries.append(entry)
         return bar
 
-    def update(self, bar: ProgressBar, downloaded_bytes: int) -> None:
+    def update(self, bar: ProgressBar | SilentProgress, downloaded_bytes: int) -> None:
         """Advance *bar* and schedule a re-render of all visible bars.
 
         Args:
@@ -632,7 +617,7 @@ class MultiProgress:
         bar.update(downloaded_bytes)
         self._render_all()
 
-    def finish(self, bar: ProgressBar) -> None:
+    def finish(self, bar: ProgressBar | SilentProgress) -> None:
         """Mark *bar* as complete and re-render all visible bars.
 
         Args:
