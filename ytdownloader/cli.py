@@ -13,6 +13,7 @@ from __future__ import annotations
 import argparse
 import sys
 
+from .constants import QUALITY_CHOICES
 from .downloader import download_audio, download_video, print_video_info
 from .utils import is_valid_youtube_url
 
@@ -47,7 +48,7 @@ def main(args: list[str] | None = None) -> int:
     parser.add_argument(
         "--quality",
         default="best",
-        choices=["best", "4320p", "2160p", "1440p", "1080p", "720p", "480p", "360p", "240p", "144p"],
+        choices=QUALITY_CHOICES,
         help="Video quality to download (default: best)",
     )
     parser.add_argument(

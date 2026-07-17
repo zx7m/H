@@ -16,6 +16,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import requests
 
+from .constants import QUALITY_CHOICES
 from .metadata import MetadataExtractionError, get_video_info
 from .stream_resolver import StreamResolutionError, resolve_streams
 from .utils import extract_video_id, is_valid_youtube_url, normalize_youtube_url
@@ -338,6 +339,14 @@ def download_video(
         raise ValueError(f"Invalid YouTube URL: {url}")
 
     normalized_url = normalize_youtube_url(url)
+
+    quality = (quality or "best").strip().lower()
+    if quality not in QUALITY_CHOICES:
+        raise ValueError(
+            f"Unsupported quality '{quality}'. "
+            f"Supported values: {', '.join(QUALITY_CHOICES)}."
+        )
+
     info = get_video_info(normalized_url)
 
     streaming_data = info.get("streamingData") or info.get("streaming_data") or {}
