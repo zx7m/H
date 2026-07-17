@@ -13,6 +13,7 @@ from __future__ import annotations
 import argparse
 import sys
 
+from .constants import QUALITY_CHOICES
 from .downloader import download_audio, download_video, print_video_info
 from .utils import is_valid_youtube_url
 
@@ -43,6 +44,12 @@ def main(args: list[str] | None = None) -> int:
         "-o",
         default=".",
         help="Output directory for downloaded files (default: current directory)",
+    )
+    parser.add_argument(
+        "--quality",
+        default="best",
+        choices=QUALITY_CHOICES,
+        help="Video quality to download (default: best)",
     )
     parser.add_argument(
         "--quiet",
@@ -76,7 +83,12 @@ def main(args: list[str] | None = None) -> int:
             print(f"Audio saved to: {output_path}")
         else:
             print(f"Downloading video from: {url}")
-            output_path = download_video(url, output_path=parsed.output, quiet=parsed.quiet)
+            output_path = download_video(
+                url,
+                output_path=parsed.output,
+                quiet=parsed.quiet,
+                quality=parsed.quality,
+            )
             print(f"Video saved to: {output_path}")
 
         return 0
