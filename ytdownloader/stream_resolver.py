@@ -19,11 +19,6 @@ class StreamResolutionError(Exception):
     """Raised when a stream URL cannot be resolved."""
 
 
-_SIGNATURE_CIPHER_PATTERN = re.compile(
-    r"(?:^|&)(s|sp|url|n)=([^&]*)",
-    re.IGNORECASE,
-)
-
 _YT_HOST_PATTERN = re.compile(
     r"^https?://(?:[a-z0-9-]+\.)?googlevideo\.com/",
     re.IGNORECASE,
@@ -86,14 +81,14 @@ def _decode_cipher(cipher: str) -> Dict[str, str]:
             ``s=abc123&sp=signature&url=https%3A%2F%2F...&n=A_vI6Ix_3g``.
 
     Returns:
-        A dict with keys ``s``, ``sp``, ``url``, ``n``.
+        A dict mapping parameter names to their decoded values; typically
+        includes ``s``, ``sp``, ``url``, ``n``.
     """
-    decoded = urllib.parse.unquote_plus(cipher)
-    result: Dict[str, str] = {}
-    for match in _SIGNATURE_CIPHER_PATTERN.finditer(decoded):
-        key = match.group(1).lower()
-        result[key] = match.group(2)
-    return result
+    params = urllib.parse.parse_qs(cipher, keep_blank_values=True)
+    return {
+        key.lower(): values[-1] if values else ""
+        for key, values in params.items()
+    }
 
 
 def _resolve_n_parameter(n_value: str, base_url: str) -> str:
@@ -248,6 +243,11 @@ def _parse_format(fmt: Dict[str, Any]) -> Dict[str, Any]:
             f"Cannot resolve format itag={fmt.get('itag', 'unknown')}: {error}"
         )
 
+    if not _YT_HOST_PATTERN.match(resolved_url):
+        raise StreamResolutionError(
+            f"Resolved URL does not point to a recognized YouTube host: {resolved_url}"
+        )
+
     result: Dict[str, Any] = {
         "itag": _safe_int(fmt.get("itag")),
         "mime_type": mime_info["mime"],
@@ -262,8 +262,8 @@ def _parse_format(fmt: Dict[str, Any]) -> Dict[str, Any]:
         "bitrate": tbr,
         "content_length": content_length,
         "approx_duration_ms": approx_duration_ms,
-        "is_dash": fmt.get("type") == "FORMAT_DASH" or not url,
-        "is_hls": fmt.get("type") == "FORMAT_HLS",
+        "is_dash": fmt.get("type") == "FORMAT_DASH",
+        "is_hls": fmt.get("type") == "FORMAT_STREAMTYPE_HLS",
         "protocol": fmt.get("protocol", "http"),
         "url": resolved_url,
         "signature_cipher": signature_cipher,
@@ -321,7 +321,7 @@ def resolve_streams(streaming_data: Dict[str, Any]) -> List[Dict[str, Any]]:
         try:
             resolved.append(_parse_format(fmt))
         except StreamResolutionError:
-            raise
+            continue
         except (TypeError, ValueError, KeyError) as exc:
             raise StreamResolutionError(
                 f"Failed to parse format: {exc}"
