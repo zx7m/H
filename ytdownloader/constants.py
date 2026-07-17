@@ -691,9 +691,9 @@ ITAG_DETAILS: Dict[int, Dict[str, str]] = {
     271: {"container": "webm", "vcodec": "vp9", "acodec": "none", "protocol": "http", "mime": "video/webm"},
     272: {"container": "webm", "vcodec": "vp9", "acodec": "none", "protocol": "http", "mime": "video/webm"},
     278: {"container": "webm", "vcodec": "vp9", "acodec": "none", "protocol": "http", "mime": "video/webm"},
-    302: {"container": "webm", "vcodec": "vp9", "acodec": "opus", "protocol": "http", "mime": "audio/webm"},
-    303: {"container": "webm", "vcodec": "vp9", "acodec": "opus", "protocol": "http", "mime": "audio/webm"},
-    308: {"container": "webm", "vcodec": "vp9", "acodec": "opus", "protocol": "http", "mime": "audio/webm"},
+    302: {"container": "webm", "vcodec": "none", "acodec": "opus", "protocol": "http", "mime": "audio/webm"},
+    303: {"container": "webm", "vcodec": "none", "acodec": "opus", "protocol": "http", "mime": "audio/webm"},
+    308: {"container": "webm", "vcodec": "none", "acodec": "opus", "protocol": "http", "mime": "audio/webm"},
     313: {"container": "webm", "vcodec": "vp9", "acodec": "opus", "protocol": "http", "mime": "video/webm"},
     315: {"container": "webm", "vcodec": "vp9", "acodec": "opus", "protocol": "http", "mime": "video/webm"},
     330: {"container": "mp4", "vcodec": "h264", "acodec": "aac", "protocol": "http", "mime": "video/mp4"},
@@ -870,7 +870,8 @@ QUALITY_HEIGHT_MAP: Dict[str, int] = {
 }
 
 #: Maximum quality level name.
-MAX_QUALITY: str = "2160p"
+#: Derived from QUALITY_HEIGHT_MAP to ensure it stays in sync with available qualities.
+MAX_QUALITY: str = max(QUALITY_HEIGHT_MAP, key=QUALITY_HEIGHT_MAP.get)
 
 #: Minimum quality level name.
 MIN_QUALITY: str = "144p"
