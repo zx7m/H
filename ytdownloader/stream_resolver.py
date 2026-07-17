@@ -10,24 +10,20 @@ No yt-dlp dependency.
 
 from __future__ import annotations
 
+import logging
 import re
 import urllib.parse
 from typing import Any, Dict, List, Optional
+
+
+logger = logging.getLogger(__name__)
 
 
 class StreamResolutionError(Exception):
     """Raised when a stream URL cannot be resolved."""
 
 
-_SIGNATURE_CIPHER_PATTERN = re.compile(
-    r"(?:^|&)(s|sp|url|n)=([^&]*)",
-    re.IGNORECASE,
-)
-
-_YT_HOST_PATTERN = re.compile(
-    r"^https?://(?:[a-z0-9-]+\.)?googlevideo\.com/",
-    re.IGNORECASE,
-)
+_YT_HOST_PATTERN = r"^https?://(?:[a-z0-9-]+\.)?googlevideo\.com/"
 
 
 def _parse_mime_type(mime_type: str) -> Dict[str, str]:
@@ -81,19 +77,22 @@ def _safe_int(value: Any) -> Optional[int]:
 def _decode_cipher(cipher: str) -> Dict[str, str]:
     """Decode a URL-encoded ``signatureCipher`` string.
 
+    Uses :func:`urllib.parse.parse_qs` so parameter ordering, encoding
+    semantics, and additional parameters are handled robustly.
+
     Args:
         cipher: URL-encoded cipher string like
             ``s=abc123&sp=signature&url=https%3A%2F%2F...&n=A_vI6Ix_3g``.
 
     Returns:
-        A dict with keys ``s``, ``sp``, ``url``, ``n``.
+        A dict mapping parameter names to their decoded values; typically
+        includes ``s``, ``sp``, ``url``, ``n``.
     """
-    decoded = urllib.parse.unquote_plus(cipher)
-    result: Dict[str, str] = {}
-    for match in _SIGNATURE_CIPHER_PATTERN.finditer(decoded):
-        key = match.group(1).lower()
-        result[key] = match.group(2)
-    return result
+    params = urllib.parse.parse_qs(cipher, keep_blank_values=True)
+    return {
+        key.lower(): values[-1] if values else ""
+        for key, values in params.items()
+    }
 
 
 def _resolve_n_parameter(n_value: str, base_url: str) -> str:
@@ -188,6 +187,21 @@ def _resolve_cipher_url(cipher: str) -> str:
     return decoded_url
 
 
+def _validate_stream_url(url: str) -> None:
+    """Validate that a resolved URL points to a YouTube googlevideo host.
+
+    Args:
+        url: The resolved stream URL.
+
+    Raises:
+        StreamResolutionError: If the URL does not match the expected host.
+    """
+    if not re.match(_YT_HOST_PATTERN, url, re.IGNORECASE):
+        raise StreamResolutionError(
+            f"Resolved URL does not point to a YouTube stream host: {url}"
+        )
+
+
 def _append_signature(url: str, signature: str, sp: str = "signature") -> str:
     """Append a signature parameter to a stream URL.
 
@@ -211,6 +225,9 @@ def _parse_format(fmt: Dict[str, Any]) -> Dict[str, Any]:
 
     Returns:
         A normalized format dict with resolved URL and parsed metadata.
+
+    Raises:
+        StreamResolutionError: If the format cannot be resolved.
     """
     mime_info = _parse_mime_type(fmt.get("mimeType", ""))
 
@@ -226,27 +243,24 @@ def _parse_format(fmt: Dict[str, Any]) -> Dict[str, Any]:
     signature_cipher = fmt.get("signatureCipher")
 
     resolved_url: Optional[str] = None
-    error: Optional[str] = None
 
     if url:
         try:
             resolved_url = str(url)
         except (TypeError, ValueError):
-            resolved_url = None
-            error = "url field is not a valid string"
+            raise StreamResolutionError(
+                f"Cannot resolve format itag={fmt.get('itag', 'unknown')}: url field is not a valid string."
+            )
 
     if resolved_url is None and signature_cipher:
-        try:
-            resolved_url = _resolve_cipher_url(str(signature_cipher))
-        except StreamResolutionError as exc:
-            error = str(exc)
-            resolved_url = None
+        resolved_url = _resolve_cipher_url(str(signature_cipher))
 
     if resolved_url is None:
-        error = error or "No url or signatureCipher found in format."
         raise StreamResolutionError(
-            f"Cannot resolve format itag={fmt.get('itag', 'unknown')}: {error}"
+            f"Cannot resolve format itag={fmt.get('itag', 'unknown')}: No url or signatureCipher found in format."
         )
+
+    _validate_stream_url(resolved_url)
 
     result: Dict[str, Any] = {
         "itag": _safe_int(fmt.get("itag")),
@@ -262,8 +276,8 @@ def _parse_format(fmt: Dict[str, Any]) -> Dict[str, Any]:
         "bitrate": tbr,
         "content_length": content_length,
         "approx_duration_ms": approx_duration_ms,
-        "is_dash": fmt.get("type") == "FORMAT_DASH" or not url,
-        "is_hls": fmt.get("type") == "FORMAT_HLS",
+        "is_dash": fmt.get("type") == "FORMAT_DASH",
+        "is_hls": fmt.get("type") == "FORMAT_STREAMTYPE_HLS",
         "protocol": fmt.get("protocol", "http"),
         "url": resolved_url,
         "signature_cipher": signature_cipher,
@@ -283,7 +297,8 @@ def resolve_streams(streaming_data: Dict[str, Any]) -> List[Dict[str, Any]]:
     Enumerates formats from both ``formats`` and ``adaptiveFormats``, parses
     their metadata, resolves direct URLs (handling both ``url`` and
     ``signatureCipher`` fields), and returns a flat list of resolved format
-    dicts.
+    dicts. Individual formats that fail to resolve are skipped so that valid
+    formats from the same batch are still returned.
 
     Args:
         streaming_data: The ``streamingData`` dict extracted from
@@ -296,10 +311,6 @@ def resolve_streams(streaming_data: Dict[str, Any]) -> List[Dict[str, Any]]:
         ``content_length``, ``approx_duration_ms``, ``is_dash``, ``is_hls``,
         ``protocol``, ``url``, ``signature_cipher``, ``quality_label``,
         ``quality``, and optionally ``ext``.
-
-    Raises:
-        StreamResolutionError: If the input is not a dict or if individual
-            formats cannot be resolved.
     """
     if not isinstance(streaming_data, dict):
         raise StreamResolutionError(
@@ -320,11 +331,11 @@ def resolve_streams(streaming_data: Dict[str, Any]) -> List[Dict[str, Any]]:
     for fmt in all_raw:
         try:
             resolved.append(_parse_format(fmt))
-        except StreamResolutionError:
-            raise
+        except StreamResolutionError as exc:
+            logger.warning("Skipping unresolvable format: %s", exc)
         except (TypeError, ValueError, KeyError) as exc:
-            raise StreamResolutionError(
-                f"Failed to parse format: {exc}"
-            ) from exc
+            logger.warning(
+                "Skipping format due to unexpected error: %s", exc
+            )
 
     return resolved
