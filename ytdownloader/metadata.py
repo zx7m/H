@@ -11,6 +11,7 @@ from __future__ import annotations
 import json
 import re
 from typing import Any, Dict, Optional
+from urllib.parse import urlparse
 
 import requests
 
@@ -23,6 +24,9 @@ GEO_RESTRICTED_REASONS = {
     "GEO_RESTRICTED",
     "COPYRIGHTED_CONTENT",
     "LIVE_STREAM_OFFLINE",
+}
+
+AGE_CHECK_REASONS = {
     "AGE_CHECK_NOT_ALLOWED",
     "AGE_CHECK_REQUIRED",
 }
@@ -117,6 +121,10 @@ def _fetch_page(url: str) -> str:
         raise MetadataExtractionError(
             f"HTTP error {status_code} when fetching video page."
         ) from exc
+    except requests.exceptions.RequestException as exc:
+        raise MetadataExtractionError(
+            "An error occurred while contacting YouTube. Please try again later."
+        ) from exc
     return response.text
 
 
@@ -132,7 +140,8 @@ def _validate_url(url: str) -> None:
         raise MetadataExtractionError(
             f"Invalid URL: {url!r}. Expected a full URL starting with http(s)://."
         )
-    if "youtube.com" not in url and "youtu.be" not in url:
+    netloc = urlparse(url).netloc.lower()
+    if not (netloc == "youtube.com" or netloc.endswith(".youtube.com") or netloc == "youtu.be"):
         raise MetadataExtractionError(
             f"URL does not appear to be a YouTube link: {url!r}"
         )
@@ -153,7 +162,7 @@ def get_video_info(url: str) -> Dict[str, Any]:
     playability = player_data.get("playabilityStatus", {})
     status = _check_playability(playability)
 
-    if status in (None, "", "AGE_CHECK_NOT_ALLOWED", "AGE_CHECK_REQUIRED"):
+    if status in AGE_CHECK_REASONS or not status:
         reason = playability.get("reason", "Age-restricted content.")
         raise MetadataExtractionError(
             f"Age verification required: {reason}"
