@@ -13,8 +13,7 @@ import re
 import shutil
 import sys
 import time
-from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple, Union
+from typing import Any, Dict, List, Optional, Tuple
 
 import requests
 
@@ -33,64 +32,6 @@ def _safe_int(value: Any) -> Optional[int]:
         return int(value)
     except (ValueError, TypeError):
         return None
-
-
-def _parse_stream(fmt: Dict[str, Any]) -> Dict[str, Any]:
-    """Normalize a raw format dict from streamingData into a stream descriptor."""
-    from .stream_resolver import _safe_int as _sr_safe_int
-
-    height = _sr_safe_int(fmt.get("height"))
-    abr = _sr_safe_int(fmt.get("abr"))
-    tbr = _sr_safe_int(fmt.get("tbr"))
-    vbr = _sr_safe_int(fmt.get("vbr"))
-    content_length = _sr_safe_int(fmt.get("contentLength"))
-
-    mime = (fmt.get("mimeType") or "").split(";")[0].strip().lower()
-    ext = fmt.get("ext") or _guess_ext(mime)
-
-    vcodec = fmt.get("vcodec") or ""
-    acodec = fmt.get("acodec") or ""
-    has_video = vcodec not in ("none", "")
-    has_audio = acodec not in ("none", "")
-
-    return {
-        "itag": _sr_safe_int(fmt.get("itag")),
-        "mime_type": mime,
-        "vcodec": vcodec,
-        "acodec": acodec,
-        "width": _sr_safe_int(fmt.get("width")),
-        "height": height,
-        "fps": _sr_safe_int(fmt.get("fps")),
-        "tbr": tbr,
-        "abr": abr,
-        "vbr": vbr,
-        "bitrate": tbr if tbr else (vbr if vbr else abr),
-        "content_length": content_length,
-        "approx_duration_ms": _sr_safe_int(fmt.get("approxDurationMs")),
-        "is_dash": fmt.get("type") == "FORMAT_DASH",
-        "is_hls": fmt.get("type") == "FORMAT_STREAMTYPE_HLS",
-        "protocol": fmt.get("protocol", "http"),
-        "url": fmt.get("url"),
-        "signature_cipher": fmt.get("signatureCipher"),
-        "quality_label": fmt.get("qualityLabel"),
-        "quality": height if height else (abr if abr else (tbr if tbr else 0)),
-        "ext": ext,
-        "has_video": has_video,
-        "has_audio": has_audio,
-    }
-
-
-def _guess_ext(mime: str) -> str:
-    """Guess file extension from a MIME type."""
-    if not mime:
-        return "mp4"
-    if "webm" in mime:
-        return "webm"
-    if "mp4" in mime:
-        return "mp4"
-    if "audio" in mime:
-        return "m4a"
-    return "mp4"
 
 
 def _resolve_stream_url(fmt: Dict[str, Any]) -> Optional[str]:
@@ -200,28 +141,26 @@ def _format_size(content_length: Any) -> str:
 def _build_output_filename(
     info: Dict[str, Any],
     stream: Dict[str, Any],
-    output_dir: str,
+    output_path: str,
 ) -> str:
-    """Build the output file path for a downloaded stream."""
+    """Build the output file path for a downloaded stream.
+
+    If ``output_path`` is an existing directory, the file is named
+    ``<title> [<id>].<ext>`` inside it.  If ``output_path`` points to a
+    non-existent path or has a file extension, it is treated as the
+    explicit target file path.
+    """
     title = info.get("title") or "Unknown"
     video_id = info.get("id") or "unknown"
     ext = stream.get("ext") or "mp4"
 
     safe_title = re.sub(r'[\\/:*?"<>|\x00-\x1f]', "_", title).strip() or "Unknown"
-    filename = f"{safe_title} [{video_id}].{ext}"
-    return os.path.join(output_dir, filename)
 
+    if os.path.isdir(output_path) or not os.path.splitext(output_path)[1]:
+        filename = f"{safe_title} [{video_id}].{ext}"
+        return os.path.join(output_path, filename)
 
-def _get_stream_ranges(total_size: int) -> List[Tuple[int, int]]:
-    """Split total_size into 1 MB chunks represented as (start, end) byte ranges."""
-    chunk_size = 1024 * 1024
-    ranges = []
-    offset = 0
-    while offset < total_size:
-        end = min(offset + chunk_size - 1, total_size - 1)
-        ranges.append((offset, end))
-        offset = end + 1
-    return ranges
+    return output_path
 
 
 def _download_stream(
@@ -265,7 +204,6 @@ def _download_stream(
 
             mode = "ab" if downloaded > 0 else "wb"
             start_time = time.monotonic()
-            last_bytes = downloaded
 
             with open(temp_path, mode) as fh:
                 for chunk in response.iter_content(chunk_size=1024 * 256):
@@ -279,10 +217,8 @@ def _download_stream(
                             downloaded,
                             content_length,
                             start_time,
-                            last_bytes,
                             desc,
                         )
-                        last_bytes = downloaded
 
     except KeyboardInterrupt:
         if os.path.exists(temp_path):
@@ -299,7 +235,6 @@ def _print_progress(
     downloaded: int,
     total: Optional[int],
     start_time: float,
-    last_bytes: int,
     desc: str,
 ) -> None:
     """Print a single-line progress indicator to stdout."""
@@ -307,7 +242,7 @@ def _print_progress(
     if elapsed <= 0:
         return
 
-    speed = (downloaded - last_bytes) / elapsed if elapsed > 0 else 0
+    speed = downloaded / elapsed
     speed_str = _format_speed(speed)
 
     if total:
@@ -442,8 +377,7 @@ def download_audio(
     Args:
         url: A valid YouTube watch/shorts/embed URL.
         output_path: Directory or file path for the output.  If a directory
-            is given the file is named ``<title> [<id>].m4a`` (or ``.mp3``
-            when ffmpeg is available and conversion succeeds).
+            is given the file is named ``<title> [<id>].m4a``.
         quiet: Suppress progress output when ``True``.
 
     Returns:
@@ -474,9 +408,6 @@ def download_audio(
 
     stream = select_format(audio_streams, quality="best")
     output_file = _build_output_filename(info, stream, output_path)
-
-    if _HAS_FFMPEG and not output_file.endswith(".mp3"):
-        output_file = os.path.splitext(output_file)[0] + ".mp3"
 
     stream_url = _resolve_stream_url(stream)
 
