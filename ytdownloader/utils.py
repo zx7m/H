@@ -9,6 +9,7 @@ inspection, encoding/decoding, and general-purpose data manipulation.
 from __future__ import annotations
 
 import hashlib
+import json
 import re
 import time
 import unicodedata
@@ -62,7 +63,7 @@ def extract_video_id(url: str) -> str | None:
         return match.group(1)
     if parsed.netloc in ("youtu.be", "www.youtu.be"):
         candidate = parsed.path.lstrip("/")
-        if len(candidate) == 11:
+        if VIDEO_ID_PATTERN.fullmatch(candidate):
             return candidate
     return None
 
@@ -238,18 +239,13 @@ def is_geo_restricted(response: dict) -> bool:
     status = playability.get("status", "")
     if status in ("AGE_CHECK_REQUIRED", "AGE_VERIFICATION_REQUIRED"):
         return False
+    if "LIVE_STATUS_OFFLINE" in status:
+        return False
     reason = (playability.get("reason") or "").lower()
     geo_indicators = [
         "not available in your country",
-        "country",
-        "region",
-        "geo",
-        "not available",
+        "not available in your region",
     ]
-    if "LIVE_STATUS_OFFLINE" in status:
-        return False
-    if status in ("AGE_CHECK_REQUIRED", "AGE_VERIFICATION_REQUIRED"):
-        return False
     return any(indicator in reason for indicator in geo_indicators)
 
 
@@ -346,7 +342,7 @@ def parse_mime_type(mime: str) -> dict[str, str | None]:
             for codec in codec_list:
                 if codec.startswith("avc1") or codec.startswith("vp9") or codec.startswith("vp8") or codec == "av01":
                     vcodec = codec
-                elif codec in ("mp4a", "opus", "vorbis"):
+                elif codec.startswith("mp4a") or codec.startswith("opus") or codec.startswith("vorbis"):
                     acodec = codec
     return {
         "mime": main,
@@ -428,6 +424,14 @@ def safe_get(d: dict, *keys: str, default: Any = None) -> Any:
     return current
 
 
+def _normalize_cache_arg(arg: Any) -> str:
+    if isinstance(arg, dict):
+        return json.dumps(arg, sort_keys=True, default=str)
+    if isinstance(arg, (list, tuple)):
+        return json.dumps(list(arg), sort_keys=True, default=str)
+    return str(arg)
+
+
 def generate_cache_key(*args: Any) -> str:
     """Generate a deterministic cache key from arbitrary arguments.
 
@@ -437,7 +441,7 @@ def generate_cache_key(*args: Any) -> str:
     Returns:
         A hexadecimal MD5 digest string representing the cache key.
     """
-    raw = "\x00".join(str(arg) for arg in args)
+    raw = "\x00".join(_normalize_cache_arg(arg) for arg in args)
     return hashlib.md5(raw.encode("utf-8")).hexdigest()
 
 
@@ -477,6 +481,8 @@ def retry(
     def decorator(fn):
         @wraps(fn)
         def wrapper(*fn_args, **fn_kwargs):
+            if max_retries < 1:
+                raise ValueError("max_retries must be a positive integer")
             last_exception = None
             current_delay = delay
             for attempt in range(1, max_retries + 1):
