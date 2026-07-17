@@ -94,7 +94,7 @@ def _print_metadata(info: Dict[str, Any]) -> None:
     print()
 
 
-def _format_sort_key(fmt: Dict[str, Any]) -> int:
+def _format_sort_key(fmt: Dict[str, Any]) -> tuple[int, int, int]:
     vcodec = fmt.get("vcodec", "")
     acodec = fmt.get("acodec", "")
     height = fmt.get("height", 0) or 0
@@ -173,8 +173,6 @@ def download_video(
     if _HAS_FFMPEG and opts.get("merge_output_format") and not filename.endswith(".mp4"):
         base, _ = os.path.splitext(filename)
         filename = base + ".mp4"
-    return filename
-
     return filename
 
 

@@ -55,7 +55,6 @@ def normalize_youtube_url(url: str) -> str:
 
 
 def extract_video_id(url: str) -> str | None:
-    url = normalize_youtube_url(url)
     parsed = urlparse(url)
     params = parse_qs(parsed.query)
     v = params.get("v")

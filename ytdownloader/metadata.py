@@ -11,9 +11,54 @@ from typing import Any, Dict, Optional
 import requests
 
 INITIAL_PLAYER_RESPONSE_PATTERN = re.compile(
-    r"var ytInitialPlayerResponse\s*=\s*(\{.+?\});(?:var|</script>)",
+    r"var\s+ytInitialPlayerResponse\s*=\s*(\{)",
     re.DOTALL,
 )
+
+
+def _extract_json_object(html: str, start: int) -> Optional[str]:
+    depth = 0
+    in_string = False
+    escape_next = False
+    i = start
+    while i < len(html):
+        ch = html[i]
+        if escape_next:
+            escape_next = False
+            i += 1
+            continue
+        if ch == "\\" and in_string:
+            escape_next = True
+            i += 1
+            continue
+        if ch == '"' and not escape_next:
+            in_string = not in_string
+            i += 1
+            continue
+        if in_string:
+            i += 1
+            continue
+        if ch == "{":
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+            if depth == 0:
+                return html[start : i + 1]
+        i += 1
+    return None
+
+
+def _extract_initial_player_response(html: str) -> Optional[Dict[str, Any]]:
+    match = INITIAL_PLAYER_RESPONSE_PATTERN.search(html)
+    if not match:
+        return None
+    json_str = _extract_json_object(html, match.start(1))
+    if not json_str:
+        return None
+    try:
+        return json.loads(json_str)
+    except (json.JSONDecodeError, IndexError):
+        return None
 
 
 class MetadataExtractionError(Exception):
@@ -33,16 +78,6 @@ def _fetch_page(url: str) -> str:
     response = requests.get(url, headers=headers, timeout=15)
     response.raise_for_status()
     return response.text
-
-
-def _extract_initial_player_response(html: str) -> Optional[Dict[str, Any]]:
-    match = INITIAL_PLAYER_RESPONSE_PATTERN.search(html)
-    if not match:
-        return None
-    try:
-        return json.loads(match.group(1))
-    except (json.JSONDecodeError, IndexError):
-        return None
 
 
 def _check_playability(status: Dict[str, Any]) -> str:
@@ -77,7 +112,7 @@ def get_video_info(url: str) -> Dict[str, Any]:
         raise MetadataExtractionError(
             "Age-restricted video not allowed."
         )
-    if status in ("ERROR", "AGE_RESTRICTED", "AGE_CHECK_REQUIRED"):
+    if status in ("ERROR", "AGE_RESTRICTED"):
         reason = playability.get("reason", "Unknown error")
         raise MetadataExtractionError(f"YouTube error: {reason}")
 
