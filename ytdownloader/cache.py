@@ -144,7 +144,15 @@ class CacheManager:
             CacheError: If the value cannot be serialised or written to
                 the cache file.
         """
-        effective_ttl = self._default_ttl if ttl is None else ttl
+        if ttl is None:
+            effective_ttl = self._default_ttl
+        else:
+            if not MIN_CACHE_TTL <= ttl <= MAX_CACHE_TTL:
+                raise CacheError(
+                    f"TTL {ttl!r} for key {key!r} is outside the allowed range "
+                    f"[{MIN_CACHE_TTL}, {MAX_CACHE_TTL}]"
+                )
+            effective_ttl = ttl
         cache_path = self._get_cache_path(key)
         timestamp = time.time()
 
@@ -299,6 +307,27 @@ class CacheManager:
             return False
         return True
 
+    def _load_entry(self, entry: Path) -> tuple[str | None, Any | None, bool]:
+        """Load a cache entry once and determine its expiry status.
+
+        Returns:
+            A tuple of ``(stored_key, value, is_expired)``.  On any
+            error, ``stored_key`` and ``value`` are ``None`` and
+            ``is_expired`` is ``True`` so callers can treat the entry as
+            invalid/expired.
+        """
+        try:
+            with entry.open("r", encoding=_KEY_ENCODING) as fh:
+                payload = json.load(fh)
+        except (OSError, json.JSONDecodeError):
+            return None, None, True
+
+        stored_key = payload.get("key")
+        stored_value = payload.get("value")
+        is_expired = self._is_expired(entry, payload=payload)
+
+        return stored_key, stored_value, is_expired
+
     def keys(self) -> list[str]:
         """Return a list of all non-expired cache keys.
 
@@ -312,23 +341,15 @@ class CacheManager:
         result: list[str] = []
         for entry in self._cache_dir.iterdir():
             if entry.is_file() and self._is_cache_file(entry):
-                if self._is_expired(entry):
+                stored_key, _, is_expired = self._load_entry(entry)
+                if is_expired:
                     try:
                         entry.unlink()
                     except OSError:
                         pass
                     continue
-                try:
-                    with entry.open("r", encoding=_KEY_ENCODING) as fh:
-                        data: dict[str, Any] = json.load(fh)
-                    stored_key = data.get("key")
-                    if stored_key is not None:
-                        result.append(stored_key)
-                except (OSError, json.JSONDecodeError):
-                    try:
-                        entry.unlink()
-                    except OSError:
-                        pass
+                if stored_key is not None:
+                    result.append(stored_key)
         result.sort()
         return result
 
@@ -345,24 +366,15 @@ class CacheManager:
         result: list[tuple[str, Any]] = []
         for entry in self._cache_dir.iterdir():
             if entry.is_file() and self._is_cache_file(entry):
-                if self._is_expired(entry):
+                stored_key, stored_value, is_expired = self._load_entry(entry)
+                if is_expired:
                     try:
                         entry.unlink()
                     except OSError:
                         pass
                     continue
-                try:
-                    with entry.open("r", encoding=_KEY_ENCODING) as fh:
-                        data: dict[str, Any] = json.load(fh)
-                    stored_key = data.get("key")
-                    stored_value = data.get("value")
-                    if stored_key is not None:
-                        result.append((stored_key, stored_value))
-                except (OSError, json.JSONDecodeError):
-                    try:
-                        entry.unlink()
-                    except OSError:
-                        pass
+                if stored_key is not None:
+                    result.append((stored_key, stored_value))
         result.sort(key=lambda pair: pair[0])
         return result
 
@@ -412,37 +424,51 @@ class CacheManager:
             _HASH_ALGORITHM, key.encode(_KEY_ENCODING)
         ).hexdigest()
 
-    def _is_expired(self, cache_path: Path, ttl: int | None = None) -> bool:
+    def _is_expired(self, cache_path: Path, ttl: int | None = None, payload: dict[str, Any] | None = None) -> bool:
         """Determine whether the cache file at *cache_path* has expired.
 
         Args:
             cache_path: Path to the cache JSON file.
             ttl: Optional TTL override in seconds.  When ``None`` the
                 TTL stored inside the cache entry (or the default TTL
-                if the entry format is unexpected) is used.
+                if the entry format is unexpected) is used.  When
+                provided, *ttl* takes precedence over any stored
+                ``expires_at`` value.
+            payload: Optional already-parsed JSON payload.  When given
+                the file is not re-read, avoiding redundant I/O.
 
         Returns:
             ``True`` if the entry's ``expires_at`` timestamp is in the
             past (or cannot be determined), ``False`` otherwise.
         """
-        try:
-            with cache_path.open("r", encoding=_KEY_ENCODING) as fh:
-                entry: dict[str, Any] = json.load(fh)
-        except (OSError, json.JSONDecodeError):
-            return True
-
-        effective_ttl = ttl if ttl is not None else entry.get("ttl", self._default_ttl)
-        try:
-            expires_at = float(entry.get("expires_at", 0))
-        except (TypeError, ValueError):
-            return True
-
-        if expires_at <= 0:
-            created_at = entry.get("created_at", 0)
+        if payload is None:
             try:
-                expires_at = float(created_at) + float(effective_ttl)
+                with cache_path.open("r", encoding=_KEY_ENCODING) as fh:
+                    entry: dict[str, Any] = json.load(fh)
+            except (OSError, json.JSONDecodeError):
+                return True
+        else:
+            entry = payload
+
+        if ttl is not None:
+            try:
+                created_at = float(entry.get("created_at", 0))
             except (TypeError, ValueError):
                 return True
+            expires_at = created_at + float(ttl)
+        else:
+            try:
+                expires_at = float(entry.get("expires_at", 0))
+            except (TypeError, ValueError):
+                return True
+
+            if expires_at <= 0:
+                effective_ttl = entry.get("ttl", self._default_ttl)
+                try:
+                    created_at = float(entry.get("created_at", 0))
+                    expires_at = created_at + float(effective_ttl)
+                except (TypeError, ValueError):
+                    return True
 
         return time.time() >= expires_at
 
@@ -461,9 +487,10 @@ class CacheManager:
         return name.startswith(_CACHE_FILE_PREFIX) and name.endswith(_CACHE_FILE_SUFFIX)
 
     def __repr__(self) -> str:
+        """Return a non-mutating representation of this CacheManager."""
         return (
             f"CacheManager(cache_dir={self._cache_dir!s}, "
-            f"ttl={self._default_ttl}, size={self.size()})"
+            f"ttl={self._default_ttl})"
         )
 
     def __len__(self) -> int:
