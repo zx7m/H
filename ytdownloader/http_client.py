@@ -23,7 +23,7 @@ import http.cookiejar
 import logging
 import os
 import time
-from typing import Any, Callable, Dict, Iterable, Optional, Tuple, Union
+from typing import Any, Callable, Optional, Union
 from urllib.parse import urljoin, urlparse
 
 import requests
@@ -62,12 +62,6 @@ _RETRYABLE_STATUS_CODES: frozenset[int] = frozenset(
 _HTTP_METHOD_GET: str = "GET"
 _HTTP_METHOD_POST: str = "POST"
 _HTTP_METHOD_HEAD: str = "HEAD"
-
-_COOKIE_POLICY_NAMES: dict[str, str] = {
-    "netscape": "Netscape HTTP Cookie File",
-    "lwp": "LWP cookies",
-    "moz": "Mozilla cookies.txt",
-}
 
 _logger = get_logger(__name__)
 
@@ -874,7 +868,7 @@ class HttpClient:
             cookies_file: Path to the cookies file.
 
         Returns:
-            One of ``"netscape"``, ``"lwp"``, or ``"unknown"``.
+            One of ``"netscape"`` or ``"unknown"``.
         """
         path = os.path.expanduser(cookies_file)
         if not os.path.isabs(path):
@@ -913,7 +907,7 @@ class HttpClient:
                 f"got {type(cookies_dict).__name__}."
             )
 
-        cookie_jar = http.cookiejar.CookieJar()
+        cookie_jar = http.cookiejar.MozillaCookieJar()
         for name, value in cookies_dict.items():
             cookie = requests.cookies.create_cookie(
                 name=name,
@@ -950,9 +944,6 @@ class HttpClient:
 
         if file_format == "netscape":
             self._load_netscape_cookies(cookies_file)
-            return
-        if file_format == "lwp":
-            self._load_lwp_cookies(cookies_file)
             return
 
         try:
@@ -1151,6 +1142,7 @@ class HttpClient:
         last_chunk_bytes = 0
 
         last_exception: Optional[Exception] = None
+        response: Optional[requests.Response] = None
 
         for attempt in range(self._config.max_retries + 1):
             try:
@@ -1235,7 +1227,7 @@ class HttpClient:
                 ) from exc
 
             finally:
-                if "response" in locals() and response is not None:
+                if response is not None:
                     try:
                         response.close()
                     except Exception:  # pragma: no cover
