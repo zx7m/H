@@ -1,9 +1,9 @@
 """
-Core download logic using yt-dlp for format extraction and downloading.
+Core download logic using native stream resolution and HTTP downloader.
 
-This module leverages yt-dlp (the actively maintained fork of youtube-dl)
-which handles the complex reverse-engineering of YouTube's video delivery,
-format negotiation, and stream decryption.
+This module provides download_video, download_audio, print_video_info, and
+get_video_info_wrapper functions using the native ytdownloader modules
+(stream_resolver, http_downloader, metadata).  No yt-dlp dependency.
 """
 
 from __future__ import annotations
@@ -14,43 +14,17 @@ import sys
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Union
 
-from .metadata import MetadataExtractionError, get_video_info
-from .utils import extract_video_id, is_valid_youtube_url, normalize_youtube_url
+from .metadata import get_video_info
+from .utils import is_valid_youtube_url, normalize_youtube_url
+from .exceptions import StreamResolutionError
+from .http_downloader import (
+    compute_output_path,
+    download_audio_from_info,
+    download_video_from_info,
+)
+from .stream_resolver import parse_streaming_data, resolve_streams
 
 _HAS_FFMPEG = shutil.which("ffmpeg") is not None
-
-
-def _get_ydl_opts(
-    output_path: str = ".",
-    audio_only: bool = False,
-    quiet: bool = False,
-) -> Dict[str, Any]:
-    opts: Dict[str, Any] = {
-        "quiet": quiet,
-        "no_warnings": not quiet,
-        "outtmpl": os.path.join(output_path, "%(title)s [%(id)s].%(ext)s"),
-        "restrictfilenames": True,
-        "noplaylist": True,
-    }
-
-    if audio_only:
-        opts["format"] = "bestaudio/best"
-        if _HAS_FFMPEG:
-            opts["postprocessors"] = [
-                {
-                    "key": "FFmpegExtractAudio",
-                    "preferredcodec": "mp3",
-                    "preferredquality": "192",
-                }
-            ]
-    else:
-        if _HAS_FFMPEG:
-            opts["format"] = "bestvideo+bestaudio/best"
-            opts["merge_output_format"] = "mp4"
-        else:
-            opts["format"] = "best[ext=mp4]/bestvideo[ext=mp4]+bestaudio[ext=m4a]/best"
-
-    return opts
 
 
 def _print_metadata(info: Dict[str, Any]) -> None:
@@ -75,26 +49,25 @@ def _print_metadata(info: Dict[str, Any]) -> None:
         best_thumb = thumbnails[-1].get("url", "N/A")
         print(f"  Thumbnail:    {best_thumb}")
 
-    formats = info.get("streaming_data", {}).get("formats", [])
-    adaptive = info.get("streaming_data", {}).get("adaptiveFormats", [])
-    all_formats = formats + adaptive
+    streaming_data = info.get("streaming_data", {})
+    formats_raw = streaming_data.get("formats", []) + streaming_data.get("adaptiveFormats", [])
 
-    if all_formats:
-        print(f"\n  Available Formats ({len(all_formats)}):")
+    if formats_raw:
+        print(f"\n  Available Formats ({len(formats_raw)}):")
         print(f"  {'ID':<10} {'Type':<12} {'Quality':<15} {'Size':<12} {'Protocol'}")
         print(f"  {'-'*60}")
-        for fmt in sorted(all_formats, key=lambda f: _format_sort_key(f)):
+        for fmt in sorted(formats_raw, key=_format_sort_key):
             fmt_id = fmt.get("itag", "N/A")
             ext = fmt.get("ext", "N/A")
-            mime = fmt.get("mimeType", "")
-            quality = _format_quality_label(fmt)
+            height = fmt.get("height")
+            quality = f"{height}p" if height else (f"{fmt.get('abr')}kbps audio" if fmt.get("acodec", "none") != "none" else "unknown")
             size_str = _format_size(fmt.get("contentLength"))
             protocol = fmt.get("protocol", "N/A")
             print(f"  {fmt_id:<10} {ext:<12} {quality:<15} {size_str:<12} {protocol}")
     print()
 
 
-def _format_sort_key(fmt: Dict[str, Any]) -> tuple[int, int, int]:
+def _format_sort_key(fmt: Dict[str, Any]) -> tuple:
     vcodec = fmt.get("vcodec", "")
     acodec = fmt.get("acodec", "")
     height = fmt.get("height", 0) or 0
@@ -104,17 +77,6 @@ def _format_sort_key(fmt: Dict[str, Any]) -> tuple[int, int, int]:
     if vcodec != "none":
         return (1, height, tbr)
     return (2, height, tbr)
-
-
-def _format_quality_label(fmt: Dict[str, Any]) -> str:
-    width = fmt.get("width")
-    height = fmt.get("height")
-    if height:
-        return f"{width}x{height}" if width else f"{height}p"
-    abr = fmt.get("abr")
-    if abr:
-        return f"{abr}kbps audio"
-    return "unknown"
 
 
 def _format_size(content_length) -> str:
@@ -157,22 +119,14 @@ def download_video(
         raise ValueError(f"Invalid YouTube URL: {url}")
 
     normalized_url = normalize_youtube_url(url)
-    opts = _get_ydl_opts(output_path=output_path, audio_only=False, quiet=quiet)
+    info = get_video_info(normalized_url)
 
-    try:
-        import yt_dlp
-    except ImportError:
-        raise ImportError(
-            "yt-dlp is required for downloading. Install it with: pip install yt-dlp"
-        )
+    if not quiet:
+        print(f"Downloading video: {info.get('title', 'Unknown')}")
 
-    with yt_dlp.YoutubeDL(opts) as ydl:
-        info = ydl.extract_info(normalized_url, download=True)
-
-    filename = ydl.prepare_filename(info)
-    if _HAS_FFMPEG and opts.get("merge_output_format") and not filename.endswith(".mp4"):
-        base, _ = os.path.splitext(filename)
-        filename = base + ".mp4"
+    filename = download_video_from_info(info, output_path=output_path)
+    if not quiet:
+        print(f"Saved to: {filename}")
     return filename
 
 
@@ -185,22 +139,14 @@ def download_audio(
         raise ValueError(f"Invalid YouTube URL: {url}")
 
     normalized_url = normalize_youtube_url(url)
-    opts = _get_ydl_opts(output_path=output_path, audio_only=True, quiet=quiet)
+    info = get_video_info(normalized_url)
 
-    try:
-        import yt_dlp
-    except ImportError:
-        raise ImportError(
-            "yt-dlp is required for downloading. Install it with: pip install yt-dlp"
-        )
+    if not quiet:
+        print(f"Downloading audio: {info.get('title', 'Unknown')}")
 
-    with yt_dlp.YoutubeDL(opts) as ydl:
-        info = ydl.extract_info(normalized_url, download=True)
-
-    filename = ydl.prepare_filename(info)
-    if _HAS_FFMPEG:
-        base, _ = os.path.splitext(filename)
-        return base + ".mp3"
+    filename = download_audio_from_info(info, output_path=output_path)
+    if not quiet:
+        print(f"Saved to: {filename}")
     return filename
 
 
