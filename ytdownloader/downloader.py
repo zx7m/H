@@ -1,56 +1,507 @@
 """
-Core download logic using yt-dlp for format extraction and downloading.
+Core download logic using only requests and urllib (no yt-dlp).
 
-This module leverages yt-dlp (the actively maintained fork of youtube-dl)
-which handles the complex reverse-engineering of YouTube's video delivery,
-format negotiation, and stream decryption.
+Fetches video metadata via metadata.py, resolves stream URLs via
+stream_resolver.py, selects the best format for a given quality, and
+downloads stream bytes directly with progress indication.
 """
 
 from __future__ import annotations
 
 import os
+import re
 import shutil
 import sys
+import time
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, Dict, List, Optional, Tuple, Union
+
+import requests
 
 from .metadata import MetadataExtractionError, get_video_info
+from .stream_resolver import StreamResolutionError, resolve_streams
 from .utils import extract_video_id, is_valid_youtube_url, normalize_youtube_url
 
 _HAS_FFMPEG = shutil.which("ffmpeg") is not None
 
 
-def _get_ydl_opts(
-    output_path: str = ".",
-    audio_only: bool = False,
-    quiet: bool = False,
-) -> Dict[str, Any]:
-    opts: Dict[str, Any] = {
-        "quiet": quiet,
-        "no_warnings": not quiet,
-        "outtmpl": os.path.join(output_path, "%(title)s [%(id)s].%(ext)s"),
-        "restrictfilenames": True,
-        "noplaylist": True,
+def _safe_int(value: Any) -> Optional[int]:
+    """Safely convert a value to int, returning None on failure."""
+    if value is None:
+        return None
+    try:
+        return int(value)
+    except (ValueError, TypeError):
+        return None
+
+
+def _parse_stream(fmt: Dict[str, Any]) -> Dict[str, Any]:
+    """Normalize a raw format dict from streamingData into a stream descriptor."""
+    from .stream_resolver import _safe_int as _sr_safe_int
+
+    height = _sr_safe_int(fmt.get("height"))
+    abr = _sr_safe_int(fmt.get("abr"))
+    tbr = _sr_safe_int(fmt.get("tbr"))
+    vbr = _sr_safe_int(fmt.get("vbr"))
+    content_length = _sr_safe_int(fmt.get("contentLength"))
+
+    mime = (fmt.get("mimeType") or "").split(";")[0].strip().lower()
+    ext = fmt.get("ext") or _guess_ext(mime)
+
+    vcodec = fmt.get("vcodec") or ""
+    acodec = fmt.get("acodec") or ""
+    has_video = vcodec not in ("none", "")
+    has_audio = acodec not in ("none", "")
+
+    return {
+        "itag": _sr_safe_int(fmt.get("itag")),
+        "mime_type": mime,
+        "vcodec": vcodec,
+        "acodec": acodec,
+        "width": _sr_safe_int(fmt.get("width")),
+        "height": height,
+        "fps": _sr_safe_int(fmt.get("fps")),
+        "tbr": tbr,
+        "abr": abr,
+        "vbr": vbr,
+        "bitrate": tbr if tbr else (vbr if vbr else abr),
+        "content_length": content_length,
+        "approx_duration_ms": _sr_safe_int(fmt.get("approxDurationMs")),
+        "is_dash": fmt.get("type") == "FORMAT_DASH",
+        "is_hls": fmt.get("type") == "FORMAT_STREAMTYPE_HLS",
+        "protocol": fmt.get("protocol", "http"),
+        "url": fmt.get("url"),
+        "signature_cipher": fmt.get("signatureCipher"),
+        "quality_label": fmt.get("qualityLabel"),
+        "quality": height if height else (abr if abr else (tbr if tbr else 0)),
+        "ext": ext,
+        "has_video": has_video,
+        "has_audio": has_audio,
     }
 
-    if audio_only:
-        opts["format"] = "bestaudio/best"
-        if _HAS_FFMPEG:
-            opts["postprocessors"] = [
-                {
-                    "key": "FFmpegExtractAudio",
-                    "preferredcodec": "mp3",
-                    "preferredquality": "192",
-                }
-            ]
-    else:
-        if _HAS_FFMPEG:
-            opts["format"] = "bestvideo+bestaudio/best"
-            opts["merge_output_format"] = "mp4"
-        else:
-            opts["format"] = "best[ext=mp4]/bestvideo[ext=mp4]+bestaudio[ext=m4a]/best"
 
-    return opts
+def _guess_ext(mime: str) -> str:
+    """Guess file extension from a MIME type."""
+    if not mime:
+        return "mp4"
+    if "webm" in mime:
+        return "webm"
+    if "mp4" in mime:
+        return "mp4"
+    if "audio" in mime:
+        return "m4a"
+    return "mp4"
+
+
+def _resolve_stream_url(fmt: Dict[str, Any]) -> Optional[str]:
+    """Resolve a direct URL from a format dict, handling signatureCipher."""
+    from .stream_resolver import _resolve_cipher_url
+
+    url = fmt.get("url")
+    if url:
+        return str(url)
+    cipher = fmt.get("signatureCipher")
+    if cipher:
+        try:
+            return _resolve_cipher_url(str(cipher))
+        except StreamResolutionError:
+            return None
+    return None
+
+
+def select_format(streams: List[Dict[str, Any]], quality: Optional[str] = None) -> Dict[str, Any]:
+    """Select the best stream matching the requested quality constraint.
+
+    Args:
+        streams: A list of stream dicts as returned by ``resolve_streams``.
+        quality: Quality string such as ``'best'`` (default), ``'480p'``,
+            ``'720p'``, ``'1080p'``, etc.  When a resolution is given the
+            highest-quality stream whose ``height`` is **at or below** the
+            target is returned.
+
+    Returns:
+        The best matching stream dict.
+
+    Raises:
+        ValueError: If no streams are provided or no stream matches the
+            requested quality constraint.
+    """
+    if not streams:
+        raise ValueError("No streams available to select from.")
+
+    quality = (quality or "best").strip().lower()
+
+    if quality == "best":
+        best = max(streams, key=_stream_sort_key)
+        return best
+
+    target_height = _parse_quality_to_height(quality)
+    if target_height is None:
+        best = max(streams, key=_stream_sort_key)
+        return best
+
+    candidates = [s for s in streams if _stream_sort_key(s)[1] <= target_height]
+    if not candidates:
+        raise ValueError(
+            f"No stream found with height <= {target_height}p. "
+            "Try a lower quality or 'best'."
+        )
+
+    best = max(candidates, key=_stream_sort_key)
+    return best
+
+
+def _parse_quality_to_height(quality: str) -> Optional[int]:
+    """Convert a quality string like '480p' or '1080p' to an integer height."""
+    m = re.match(r"^(\d+)p$", quality)
+    if m:
+        return int(m.group(1))
+    return None
+
+
+def _stream_sort_key(stream: Dict[str, Any]) -> Tuple[int, int, int]:
+    """Sort key that prefers combined formats, then higher resolution, then higher bitrate."""
+    height = stream.get("height") or 0
+    bitrate = stream.get("bitrate") or 0
+
+    vcodec = (stream.get("vcodec") or "").lower()
+    acodec = (stream.get("acodec") or "").lower()
+
+    has_video = vcodec not in ("none", "")
+    has_audio = acodec not in ("none", "")
+
+    if has_video and has_audio:
+        category = 0
+    elif has_video:
+        category = 1
+    else:
+        category = 2
+
+    return (category, height, bitrate)
+
+
+def _format_size(content_length: Any) -> str:
+    """Format a byte count as a human-readable string."""
+    if content_length is None:
+        return "unknown"
+    try:
+        size_bytes = int(content_length)
+        if size_bytes > 1024 * 1024 * 1024:
+            return f"{size_bytes / (1024**3):.1f} GB"
+        if size_bytes > 1024 * 1024:
+            return f"{size_bytes / (1024**2):.1f} MB"
+        if size_bytes > 1024:
+            return f"{size_bytes / 1024:.1f} KB"
+        return f"{size_bytes} B"
+    except (ValueError, TypeError):
+        return "unknown"
+
+
+def _build_output_filename(
+    info: Dict[str, Any],
+    stream: Dict[str, Any],
+    output_dir: str,
+) -> str:
+    """Build the output file path for a downloaded stream."""
+    title = info.get("title") or "Unknown"
+    video_id = info.get("id") or "unknown"
+    ext = stream.get("ext") or "mp4"
+
+    safe_title = re.sub(r'[\\/:*?"<>|\x00-\x1f]', "_", title).strip() or "Unknown"
+    filename = f"{safe_title} [{video_id}].{ext}"
+    return os.path.join(output_dir, filename)
+
+
+def _get_stream_ranges(total_size: int) -> List[Tuple[int, int]]:
+    """Split total_size into 1 MB chunks represented as (start, end) byte ranges."""
+    chunk_size = 1024 * 1024
+    ranges = []
+    offset = 0
+    while offset < total_size:
+        end = min(offset + chunk_size - 1, total_size - 1)
+        ranges.append((offset, end))
+        offset = end + 1
+    return ranges
+
+
+def _download_stream(
+    url: str,
+    output_path: str,
+    content_length: Optional[int],
+    quiet: bool,
+    desc: str = "Downloading",
+) -> str:
+    """Download a single stream URL to output_path using range-based chunked reads."""
+    os.makedirs(os.path.dirname(os.path.abspath(output_path)) or ".", exist_ok=True)
+
+    temp_path = output_path + ".part"
+    downloaded = 0
+
+    if content_length and os.path.exists(temp_path):
+        downloaded = os.path.getsize(temp_path)
+        if downloaded >= content_length:
+            os.replace(temp_path, output_path)
+            return output_path
+
+    headers: Dict[str, str] = {
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/120.0.0.0 Safari/537.36"
+        ),
+        "Accept": "*/*",
+    }
+
+    if content_length and downloaded > 0 and downloaded < content_length:
+        headers["Range"] = f"bytes={downloaded}-"
+
+    try:
+        with requests.get(url, headers=headers, stream=True, timeout=30) as response:
+            response.raise_for_status()
+
+            if content_length is None:
+                cl = response.headers.get("Content-Length")
+                content_length = _safe_int(cl) if cl else None
+
+            mode = "ab" if downloaded > 0 else "wb"
+            start_time = time.monotonic()
+            last_bytes = downloaded
+
+            with open(temp_path, mode) as fh:
+                for chunk in response.iter_content(chunk_size=1024 * 256):
+                    if not chunk:
+                        continue
+                    fh.write(chunk)
+                    downloaded += len(chunk)
+
+                    if not quiet:
+                        _print_progress(
+                            downloaded,
+                            content_length,
+                            start_time,
+                            last_bytes,
+                            desc,
+                        )
+                        last_bytes = downloaded
+
+    except KeyboardInterrupt:
+        if os.path.exists(temp_path):
+            pass
+        raise
+
+    if os.path.exists(temp_path):
+        os.replace(temp_path, output_path)
+
+    return output_path
+
+
+def _print_progress(
+    downloaded: int,
+    total: Optional[int],
+    start_time: float,
+    last_bytes: int,
+    desc: str,
+) -> None:
+    """Print a single-line progress indicator to stdout."""
+    elapsed = time.monotonic() - start_time
+    if elapsed <= 0:
+        return
+
+    speed = (downloaded - last_bytes) / elapsed if elapsed > 0 else 0
+    speed_str = _format_speed(speed)
+
+    if total:
+        pct = min(downloaded / total * 100, 100.0)
+        done_str = _format_size(downloaded)
+        total_str = _format_size(total)
+        eta = _calc_eta(downloaded, total, start_time)
+        line = (
+            f"\r{desc}: {pct:5.1f}% "
+            f"[{done_str}/{total_str}] "
+            f"at {speed_str} "
+            f"ETA {eta}"
+        )
+    else:
+        done_str = _format_size(downloaded)
+        line = f"\r{desc}: {done_str} at {speed_str}"
+
+    sys.stdout.write(line)
+    sys.stdout.flush()
+
+
+def _format_speed(bytes_per_sec: float) -> str:
+    """Format a byte-per-second rate as a human-readable string."""
+    if bytes_per_sec <= 0:
+        return "? B/s"
+    if bytes_per_sec >= 1024 * 1024:
+        return f"{bytes_per_sec / (1024**2):.1f} MB/s"
+    if bytes_per_sec >= 1024:
+        return f"{bytes_per_sec / 1024:.1f} KB/s"
+    return f"{bytes_per_sec:.0f} B/s"
+
+
+def _calc_eta(downloaded: int, total: int, start_time: float) -> str:
+    """Calculate and format ETA from current progress."""
+    if downloaded <= 0 or total <= 0:
+        return "?"
+    elapsed = time.monotonic() - start_time
+    if elapsed <= 0:
+        return "?"
+    speed = downloaded / elapsed
+    remaining = (total - downloaded) / speed
+    if remaining >= 3600:
+        return f"{int(remaining // 3600)}h{int((remaining % 3600) // 60)}m"
+    if remaining >= 60:
+        return f"{int(remaining // 60)}m{int(remaining % 60)}s"
+    return f"{int(remaining)}s"
+
+
+def _print_newline(quiet: bool) -> None:
+    """Print a newline to stdout if not in quiet mode."""
+    if not quiet:
+        print()
+
+
+def get_video_info_wrapper(url: str) -> Dict[str, Any]:
+    """Fetch and return video info dict after URL validation."""
+    if not is_valid_youtube_url(url):
+        raise ValueError(
+            f"Invalid YouTube URL: {url}\n"
+            "Supported formats:\n"
+            "  - https://www.youtube.com/watch?v=VIDEO_ID\n"
+            "  - https://youtu.be/VIDEO_ID\n"
+            "  - https://www.youtube.com/shorts/VIDEO_ID\n"
+            "  - https://www.youtube.com/embed/VIDEO_ID"
+        )
+
+    normalized_url = normalize_youtube_url(url)
+    return get_video_info(normalized_url)
+
+
+def download_video(
+    url: str,
+    output_path: str = ".",
+    quiet: bool = False,
+) -> str:
+    """Download the best video stream for a YouTube URL.
+
+    Args:
+        url: A valid YouTube watch/shorts/embed URL.
+        output_path: Directory or file path for the output.  If a directory
+            is given the file is named ``<title> [<id>].<ext>``.
+        quiet: Suppress progress output when ``True``.
+
+    Returns:
+        The path to the downloaded file.
+
+    Raises:
+        ValueError: If the URL is not a valid YouTube URL.
+        MetadataExtractionError: If video metadata cannot be fetched.
+        StreamResolutionError: If no compatible stream URL can be resolved.
+    """
+    if not is_valid_youtube_url(url):
+        raise ValueError(f"Invalid YouTube URL: {url}")
+
+    normalized_url = normalize_youtube_url(url)
+    info = get_video_info(normalized_url)
+
+    streaming_data = info.get("streamingData") or info.get("streaming_data") or {}
+    resolved = resolve_streams(streaming_data)
+
+    video_streams = [s for s in resolved if s.get("has_video")]
+    if not video_streams:
+        raise StreamResolutionError(
+            "No video streams found for this video. It may be unavailable."
+        )
+
+    stream = select_format(video_streams, quality="best")
+    output_file = _build_output_filename(info, stream, output_path)
+    stream_url = _resolve_stream_url(stream)
+
+    if not stream_url:
+        raise StreamResolutionError(
+            f"Could not resolve download URL for itag={stream.get('itag')}."
+        )
+
+    expected_size = stream.get("content_length")
+    desc = "Downloading video"
+
+    _download_stream(stream_url, output_file, expected_size, quiet, desc)
+    _print_newline(quiet)
+
+    return output_file
+
+
+def download_audio(
+    url: str,
+    output_path: str = ".",
+    quiet: bool = False,
+) -> str:
+    """Download the best audio-only stream for a YouTube URL.
+
+    Args:
+        url: A valid YouTube watch/shorts/embed URL.
+        output_path: Directory or file path for the output.  If a directory
+            is given the file is named ``<title> [<id>].m4a`` (or ``.mp3``
+            when ffmpeg is available and conversion succeeds).
+        quiet: Suppress progress output when ``True``.
+
+    Returns:
+        The path to the downloaded file.
+
+    Raises:
+        ValueError: If the URL is not a valid YouTube URL.
+        MetadataExtractionError: If video metadata cannot be fetched.
+        StreamResolutionError: If no compatible audio stream can be resolved.
+    """
+    if not is_valid_youtube_url(url):
+        raise ValueError(f"Invalid YouTube URL: {url}")
+
+    normalized_url = normalize_youtube_url(url)
+    info = get_video_info(normalized_url)
+
+    streaming_data = info.get("streamingData") or info.get("streaming_data") or {}
+    resolved = resolve_streams(streaming_data)
+
+    audio_streams = [s for s in resolved if s.get("has_audio") and not s.get("has_video")]
+    if not audio_streams:
+        audio_streams = [s for s in resolved if s.get("has_audio")]
+
+    if not audio_streams:
+        raise StreamResolutionError(
+            "No audio streams found for this video. It may be unavailable."
+        )
+
+    stream = select_format(audio_streams, quality="best")
+    output_file = _build_output_filename(info, stream, output_path)
+
+    if _HAS_FFMPEG and not output_file.endswith(".mp3"):
+        output_file = os.path.splitext(output_file)[0] + ".mp3"
+
+    stream_url = _resolve_stream_url(stream)
+
+    if not stream_url:
+        raise StreamResolutionError(
+            f"Could not resolve download URL for itag={stream.get('itag')}."
+        )
+
+    expected_size = stream.get("content_length")
+    desc = "Downloading audio"
+
+    _download_stream(stream_url, output_file, expected_size, quiet, desc)
+    _print_newline(quiet)
+
+    return output_file
+
+
+def print_video_info(url: str) -> None:
+    """Fetch and print video metadata to stdout.
+
+    Args:
+        url: A valid YouTube watch/shorts/embed URL.
+    """
+    info = get_video_info_wrapper(url)
+    _print_metadata(info)
 
 
 def _print_metadata(info: Dict[str, Any]) -> None:
@@ -75,33 +526,35 @@ def _print_metadata(info: Dict[str, Any]) -> None:
         best_thumb = thumbnails[-1].get("url", "N/A")
         print(f"  Thumbnail:    {best_thumb}")
 
-    formats = info.get("streaming_data", {}).get("formats", [])
-    adaptive = info.get("streaming_data", {}).get("adaptiveFormats", [])
-    all_formats = formats + adaptive
+    streaming_data = info.get("streamingData") or info.get("streaming_data") or {}
+    try:
+        all_formats = resolve_streams(streaming_data)
+    except StreamResolutionError:
+        all_formats = []
 
     if all_formats:
         print(f"\n  Available Formats ({len(all_formats)}):")
         print(f"  {'ID':<10} {'Type':<12} {'Quality':<15} {'Size':<12} {'Protocol'}")
         print(f"  {'-'*60}")
-        for fmt in sorted(all_formats, key=lambda f: _format_sort_key(f)):
-            fmt_id = fmt.get("itag", "N/A")
+        for fmt in sorted(all_formats, key=_fmt_sort_key):
+            fmt_id = str(fmt.get("itag", "N/A"))
             ext = fmt.get("ext", "N/A")
-            mime = fmt.get("mimeType", "")
             quality = _format_quality_label(fmt)
-            size_str = _format_size(fmt.get("contentLength"))
+            size_str = _format_size(fmt.get("content_length"))
             protocol = fmt.get("protocol", "N/A")
             print(f"  {fmt_id:<10} {ext:<12} {quality:<15} {size_str:<12} {protocol}")
     print()
 
 
-def _format_sort_key(fmt: Dict[str, Any]) -> tuple[int, int, int]:
-    vcodec = fmt.get("vcodec", "")
-    acodec = fmt.get("acodec", "")
-    height = fmt.get("height", 0) or 0
-    tbr = fmt.get("tbr", 0) or 0
-    if vcodec != "none" and acodec != "none":
+def _fmt_sort_key(fmt: Dict[str, Any]) -> Tuple[int, int, int]:
+    vcodec = (fmt.get("vcodec") or "").lower()
+    acodec = (fmt.get("acodec") or "").lower()
+    height = fmt.get("height") or 0
+    tbr = fmt.get("tbr") or 0
+
+    if vcodec not in ("none", "") and acodec not in ("none", ""):
         return (0, height, tbr)
-    if vcodec != "none":
+    if vcodec not in ("none", ""):
         return (1, height, tbr)
     return (2, height, tbr)
 
@@ -115,95 +568,3 @@ def _format_quality_label(fmt: Dict[str, Any]) -> str:
     if abr:
         return f"{abr}kbps audio"
     return "unknown"
-
-
-def _format_size(content_length) -> str:
-    if not content_length:
-        return "unknown"
-    try:
-        size_bytes = int(content_length)
-        if size_bytes > 1024 * 1024 * 1024:
-            return f"{size_bytes / (1024**3):.1f} GB"
-        elif size_bytes > 1024 * 1024:
-            return f"{size_bytes / (1024**2):.1f} MB"
-        elif size_bytes > 1024:
-            return f"{size_bytes / 1024:.1f} KB"
-        return f"{size_bytes} B"
-    except (ValueError, TypeError):
-        return "unknown"
-
-
-def get_video_info_wrapper(url: str) -> Dict[str, Any]:
-    if not is_valid_youtube_url(url):
-        raise ValueError(
-            f"Invalid YouTube URL: {url}\n"
-            "Supported formats:\n"
-            "  - https://www.youtube.com/watch?v=VIDEO_ID\n"
-            "  - https://youtu.be/VIDEO_ID\n"
-            "  - https://www.youtube.com/shorts/VIDEO_ID\n"
-            "  - https://www.youtube.com/embed/VIDEO_ID"
-        )
-
-    normalized_url = normalize_youtube_url(url)
-    return get_video_info(normalized_url)
-
-
-def download_video(
-    url: str,
-    output_path: str = ".",
-    quiet: bool = False,
-) -> str:
-    if not is_valid_youtube_url(url):
-        raise ValueError(f"Invalid YouTube URL: {url}")
-
-    normalized_url = normalize_youtube_url(url)
-    opts = _get_ydl_opts(output_path=output_path, audio_only=False, quiet=quiet)
-
-    try:
-        import yt_dlp
-    except ImportError:
-        raise ImportError(
-            "yt-dlp is required for downloading. Install it with: pip install yt-dlp"
-        )
-
-    with yt_dlp.YoutubeDL(opts) as ydl:
-        info = ydl.extract_info(normalized_url, download=True)
-
-    filename = ydl.prepare_filename(info)
-    if _HAS_FFMPEG and opts.get("merge_output_format") and not filename.endswith(".mp4"):
-        base, _ = os.path.splitext(filename)
-        filename = base + ".mp4"
-    return filename
-
-
-def download_audio(
-    url: str,
-    output_path: str = ".",
-    quiet: bool = False,
-) -> str:
-    if not is_valid_youtube_url(url):
-        raise ValueError(f"Invalid YouTube URL: {url}")
-
-    normalized_url = normalize_youtube_url(url)
-    opts = _get_ydl_opts(output_path=output_path, audio_only=True, quiet=quiet)
-
-    try:
-        import yt_dlp
-    except ImportError:
-        raise ImportError(
-            "yt-dlp is required for downloading. Install it with: pip install yt-dlp"
-        )
-
-    with yt_dlp.YoutubeDL(opts) as ydl:
-        info = ydl.extract_info(normalized_url, download=True)
-
-    filename = ydl.prepare_filename(info)
-    if _HAS_FFMPEG:
-        base, _ = os.path.splitext(filename)
-        return base + ".mp3"
-    return filename
-
-
-def print_video_info(url: str) -> None:
-    info = get_video_info_wrapper(url)
-    _print_metadata(info)
