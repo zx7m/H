@@ -160,7 +160,6 @@ from typing import Optional
 # ---------------------------------------------------------------------------
 
 from .downloader import (
-    VideoInfo,
     download_audio,
     download_video,
     get_video_info,
