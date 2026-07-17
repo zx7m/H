@@ -162,7 +162,12 @@ def _validate_config(config: YTConfig) -> None:
             )
 
     output = Path(config.output_dir)
-    if not output.exists():
+    if output.exists():
+        if not output.is_dir():
+            errors.append(
+                f"output_dir '{config.output_dir}' exists but is not a directory."
+            )
+    else:
         try:
             output.mkdir(parents=True, exist_ok=True)
         except OSError as exc:
@@ -195,11 +200,11 @@ def apply_env_overrides(config: YTConfig) -> YTConfig:
     ignored and a warning is logged.
 
     Args:
-        config: The base configuration to mutate.
+        config: The base configuration to use as a starting point.
 
     Returns:
-        The same (mutated) :class:`YTConfig` instance, populated with
-        environment-supplied values where applicable.
+        A new :class:`YTConfig` instance populated with environment-supplied
+        values where applicable.  The original *config* is not mutated.
     """
     updated = copy.deepcopy(config)
 
@@ -211,7 +216,22 @@ def apply_env_overrides(config: YTConfig) -> YTConfig:
         current = getattr(updated, field_name)
 
         if isinstance(current, bool):
-            setattr(updated, field_name, raw_value.lower() not in {"0", "false", "no", ""})
+            normalized = raw_value.strip().lower()
+            true_values = {"1", "true", "yes"}
+            false_values = {"0", "false", "no", ""}
+
+            if normalized in true_values:
+                setattr(updated, field_name, True)
+            elif normalized in false_values:
+                setattr(updated, field_name, False)
+            else:
+                _logger.warning(
+                    "Ignoring invalid boolean value %r for env var %s (expected one of %s or %s).",
+                    raw_value,
+                    env_var,
+                    sorted(true_values),
+                    sorted(false_values),
+                )
             continue
 
         if isinstance(current, int):
@@ -437,7 +457,6 @@ def save_config(config: YTConfig, config_path: str | Path) -> None:
             the file cannot be written.
     """
     path = Path(config_path)
-    path.parent.mkdir(parents=True, exist_ok=True)
 
     data = _config_to_dict(config)
     suffix = path.suffix.lower()
@@ -449,9 +468,11 @@ def save_config(config: YTConfig, config_path: str | Path) -> None:
                     "PyYAML is required to save YAML config files. "
                     "Install it with: pip install pyyaml"
                 )
+            path.parent.mkdir(parents=True, exist_ok=True)
             with path.open("w", encoding="utf-8") as fh:
                 yaml.safe_dump(data, fh, default_flow_style=False, sort_keys=True)
         elif suffix == ".json":
+            path.parent.mkdir(parents=True, exist_ok=True)
             with path.open("w", encoding="utf-8") as fh:
                 json.dump(data, fh, indent=2, sort_keys=True)
                 fh.write("\n")
