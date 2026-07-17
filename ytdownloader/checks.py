@@ -49,6 +49,30 @@ _REQUIRED_ITAG_KEYS: frozenset[str] = frozenset({"ext", "vcodec", "acodec", "hei
 # Helpers
 # ---------------------------------------------------------------------------
 
+def _body_has_raise_or_log(body: list[ast.stmt]) -> bool:
+    """Return True if the except body contains a raise or a logging call."""
+    for stmt in body:
+        if isinstance(stmt, ast.Raise):
+            return True
+        for child in ast.walk(stmt):
+            if not isinstance(child, ast.Call):
+                continue
+            func = child.func
+            if isinstance(func, ast.Attribute) and func.attr in (
+                "log",
+                "debug",
+                "info",
+                "warning",
+                "error",
+                "critical",
+                "exception",
+            ):
+                return True
+            if isinstance(func, ast.Name) and func.id in ("log", "print"):
+                return True
+    return False
+
+
 def _iter_package_py_files(package_dir: Path | None = None) -> list[Path]:
     """Return sorted list of .py files under the package directory."""
     package_dir = package_dir or _PACKAGE_DIR
@@ -179,7 +203,7 @@ def audit_regex_patterns(package_dir: Path | None = None) -> list[tuple[str, int
                         break  # report once per pattern
 
             # --- Issue 4: missing DOTALL/IGNORECASE ---
-            flags_part = line[line.index(")") + 1 :] if ")" in line else ""
+            flags_part = line[i + 1 :] if i < len(line) else ""
             flags_str = flags_part.strip().rstrip(")").strip()
             has_dotall = "DOTALL" in flags_str
             has_ignorecase = "IGNORECASE" in flags_str
@@ -222,9 +246,11 @@ def audit_imports(package_dir: Path | None = None) -> list[dict[str, Any]]:
     package_dir = package_dir or _PACKAGE_DIR
     findings: list[dict[str, Any]] = []
 
-    # Map from module name (as used in ``from X import Y``) to the set of
-    # files that import it.  Handles both absolute and relative imports.
+    # import_graph: imported_module_name -> set of file paths that import it
     import_graph: dict[str, set[str]] = {}
+
+    # module_deps: source_module_name -> set of module names it imports
+    module_deps: dict[str, set[str]] = {}
 
     # Collect all known module names in the package so we can detect imports
     # of modules that do not exist yet.
@@ -232,21 +258,16 @@ def audit_imports(package_dir: Path | None = None) -> list[dict[str, Any]]:
     for py_file in _iter_package_py_files(package_dir):
         stem = py_file.stem
         known_modules.add(stem)
-        # Also register dotted path for sub-packages
         rel = py_file.relative_to(package_dir)
         if len(rel.parts) > 1:
             pkg_prefix = ".".join(rel.parts[:-1])
             known_modules.add(f"{pkg_prefix}.{stem}")
 
-    def _record_import(
-        file_rel: str,
-        lineno: int,
-        source_module: str,
-        imported_names: list[str],
-        is_relative: bool = False,
-    ) -> None:
-        """Record an import edge in the graph."""
-        import_graph.setdefault(source_module, set()).add(file_rel)
+    def _module_name_for_file(file_rel: str) -> str:
+        rel_path = Path(file_rel)
+        if len(rel_path.parts) > 1 and rel_path.parts[-1] == "__init__.py":
+            return ".".join(rel_path.parts[:-1])
+        return rel_path.stem
 
     for py_file in _iter_package_py_files(package_dir):
         rel = str(py_file.relative_to(package_dir))
@@ -259,20 +280,23 @@ def audit_imports(package_dir: Path | None = None) -> list[dict[str, Any]]:
         except SyntaxError:
             continue
 
+        source_module = _module_name_for_file(rel)
+
         for node in ast.walk(tree):
             if isinstance(node, ast.Import):
                 for alias in node.names:
-                    _record_import(rel, node.lineno, alias.name.split(".")[0], [])
+                    top_level = alias.name.split(".")[0]
+                    import_graph.setdefault(top_level, set()).add(rel)
+                    module_deps.setdefault(source_module, set()).add(top_level)
             elif isinstance(node, ast.ImportFrom):
                 module_name = node.module or ""
-                base = module_name.split(".")[0]
+                base = module_name.split(".")[0] if module_name else ""
                 imported = [a.name for a in node.names]
-                _record_import(rel, node.lineno, base, imported, is_relative=node.level > 0)
+                if base:
+                    import_graph.setdefault(base, set()).add(rel)
+                    module_deps.setdefault(source_module, set()).add(base)
 
-                # Check whether the referenced module file actually exists
-                # (only check within the package).
                 if node.module and node.module.startswith(".") and node.level > 0:
-                    # Relative import inside the package
                     parts = node.module.lstrip(".").split(".")
                     target_stem = parts[-1] if parts else ""
                     if target_stem and target_stem not in known_modules:
@@ -288,19 +312,13 @@ def audit_imports(package_dir: Path | None = None) -> list[dict[str, Any]]:
                     and node.module.split(".")[0] not in known_modules
                     and node.module.split(".")[0] not in sys.stdlib_module_names
                 ):
-                    # Absolute import of a package-internal module
-                    pass  # We can't easily tell; skip for now
+                    pass  # Absolute import of a package-internal module; skip for now
 
     # Detect circular import risks (A imports B AND B imports A).
-    for module_a, files_a in import_graph.items():
-        for module_b, files_b in import_graph.items():
-            if module_a >= module_b:
-                continue
-            # A file in A imports something from B and vice-versa.
-            # We approximate this by checking if A's files import B's
-            # package name and B's files import A's package name.
-            if module_b in import_graph and module_a in import_graph.get(module_b, set()):
-                for fa in files_a:
+    for module_a, deps_a in module_deps.items():
+        for module_b in deps_a:
+            if module_b in module_deps and module_a in module_deps[module_b]:
+                for fa in import_graph.get(module_a, []):
                     findings.append({
                         "file": fa,
                         "line": 0,
@@ -309,6 +327,7 @@ def audit_imports(package_dir: Path | None = None) -> list[dict[str, Any]]:
                             f"'{module_b}' and '{module_b}' imports '{module_a}'"
                         ),
                     })
+                break  # report once per module_a
 
     # Detect unused imports: find ``import X`` or ``from X import Y`` where
     # the imported name is never referenced elsewhere in the file.
@@ -394,15 +413,13 @@ def audit_exception_handling(package_dir: Path | None = None) -> list[dict[str, 
                     "issue": "Bare 'except:' clause swallows all exceptions silently",
                 })
             elif isinstance(node.type, ast.Name) and node.type.id == "Exception":
-                body_code = ast.unparse(node.body) if hasattr(ast, "unparse") else ""
-                if not body_code:
-                    # Empty body
+                if len(node.body) == 0:
                     findings.append({
                         "file": rel,
                         "line": node.lineno,
                         "issue": "Bare 'except Exception:' with empty body swallows errors silently",
                     })
-                elif "raise" not in body_code and "logging" not in body_code.lower() and "log" not in body_code.lower():
+                elif not _body_has_raise_or_log(node.body):
                     findings.append({
                         "file": rel,
                         "line": node.lineno,
@@ -680,7 +697,12 @@ def audit_constants(package_dir: Path | None = None) -> list[dict[str, Any]]:
             seen_itags[itag] = itag_map_assign.lineno  # best-effort line
 
     # --- Missing required itags ---
-    present_itags = {int(k) for k in itag_map_value.keys()}
+    present_itags: set[int] = set()
+    for k in itag_map_value.keys():
+        try:
+            present_itags.add(int(k))
+        except (ValueError, TypeError):
+            continue
     missing = _REQUIRED_ITAGS - present_itags
     for itag in sorted(missing):
         findings.append({
