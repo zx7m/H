@@ -113,7 +113,7 @@ class _ColorFormatter(logging.Formatter):
             else "%(levelname)s | %(message)s"
         )
         super().__init__(fmt, datefmt="%H:%M:%S")
-        self.use_color = use_color and sys.stdout.isatty()
+        self.use_color = use_color and _is_tty(sys.stdout)
         self.detailed = detailed
 
     def format(self, record: logging.LogRecord) -> str:
@@ -254,12 +254,20 @@ def get_logger(name: str) -> logging.Logger:
     themselves.
 
     Args:
-        name: Dotted module name (typically ``__name__``).
+        name: Dotted module name. Callers may pass either the bare module
+            name (e.g. ``"download"``) or ``__name__`` from within the
+            ``ytdownloader`` package (e.g. ``"ytdownloader.download"``);
+            any leading ``"ytdownloader."`` prefix will be stripped.
 
     Returns:
         A :class:`logging.Logger` instance configured with the package defaults.
     """
-    return logging.getLogger(f"ytdownloader.{name}")
+    package_prefix = "ytdownloader."
+    if name.startswith(package_prefix):
+        name = name[len(package_prefix) :]
+
+    full_name = f"ytdownloader.{name}" if name else "ytdownloader"
+    return logging.getLogger(full_name)
 
 
 def _configure_logging(
@@ -285,13 +293,15 @@ def _configure_logging(
     if log_file:
         os.environ.setdefault("YT_LOG_FILE", log_file)
 
-    _module_logger = YTLogger()
+    for handler in list(_module_logger._logger.handlers):
+        _module_logger._logger.removeHandler(handler)
+    _module_logger._configured = False
+
     _module_logger.set_level(level)
 
+    detailed = format_type == "detailed"
     for handler in list(_module_logger._logger.handlers):
-        use_color = handler.stream == sys.stdout
-        detailed = format_type == "detailed"
-
+        use_color = getattr(handler, "stream", None) == sys.stdout
         if isinstance(handler, logging.StreamHandler) and handler.stream == sys.stdout:
             handler.setFormatter(_ColorFormatter(use_color=use_color, detailed=detailed))
         elif isinstance(handler, logging.FileHandler):
@@ -365,7 +375,7 @@ def log_extract_start(url: str) -> None:
     Args:
         url: The YouTube URL being processed.
     """
-    _module_logger.info(_colorize("Extracting video info: %s", _ANSI_CYAN), url)
+    _module_logger.info("Extracting video info: %s", url)
 
 
 def log_extract_success(video_id: str) -> None:
@@ -374,7 +384,7 @@ def log_extract_success(video_id: str) -> None:
     Args:
         video_id: The 11-character YouTube video identifier.
     """
-    _module_logger.info(_colorize("Extracted video: %s", _ANSI_GREEN), video_id)
+    _module_logger.info("Extracted video: %s", video_id)
 
 
 def log_download_start(url: str, path: str, size: int | None = None) -> None:
@@ -385,9 +395,9 @@ def log_download_start(url: str, path: str, size: int | None = None) -> None:
         path: Local filesystem path where the stream will be saved.
         size: Expected total size in bytes, or ``None`` if unknown.
     """
-    size_str = f" ({_format_size(size)})" if size else ""
+    size_str = f" ({_format_size(size)})" if size is not None else ""
     _module_logger.info(
-        _colorize("Downloading%s -> %s", _ANSI_YELLOW),
+        "Downloading%s -> %s",
         size_str,
         path,
     )
@@ -402,11 +412,16 @@ def log_download_progress(downloaded: int, total: int | None, speed: float) -> N
         total: Expected total size in bytes, or ``None`` if unknown.
         speed: Current download speed in bytes per second.
     """
-    total_str = f"/ {_format_size(total)}" if total else ""
-    pct = f"{(downloaded / total * 100):.1f}%" if total else "?.?%"
+    total_str = f"/ {_format_size(total)}" if total is not None else ""
+    if total is not None and total > 0:
+        pct = f"{(downloaded / total * 100):.1f}%"
+    elif downloaded == 0 and (total is None or total == 0):
+        pct = "0.0%"
+    else:
+        pct = "?.?%"
     _module_logger.info(
         "%s | %s%s | %s/s",
-        _colorize(f"[{pct}]", _ANSI_CYAN),
+        f"[{pct}]",
         _format_size(downloaded),
         total_str,
         _format_speed(speed),
@@ -421,7 +436,7 @@ def log_download_complete(path: str, size: int) -> None:
         size: Final file size in bytes.
     """
     _module_logger.info(
-        _colorize("Download complete: %s (%s)", _ANSI_GREEN),
+        "Download complete: %s (%s)",
         path,
         _format_size(size),
     )
@@ -435,9 +450,9 @@ def log_format_found(itag: int, quality: str, size: int | None) -> None:
         quality: Human-readable quality label (e.g. ``"720p"``).
         size: Estimated file size in bytes, or ``None``.
     """
-    size_str = f" ~ {_format_size(size)}" if size else ""
+    size_str = f" ~ {_format_size(size)}" if size is not None else ""
     _module_logger.info(
-        _colorize("Selected itag=%d (%s%s)", _ANSI_MAGENTA),
+        "Selected itag=%d (%s%s)",
         itag,
         quality,
         size_str,
