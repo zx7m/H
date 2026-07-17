@@ -24,6 +24,7 @@ def _get_ydl_opts(
     output_path: str = ".",
     audio_only: bool = False,
     quiet: bool = False,
+    quality: str = "best",
 ) -> Dict[str, Any]:
     opts: Dict[str, Any] = {
         "quiet": quiet,
@@ -44,11 +45,22 @@ def _get_ydl_opts(
                 }
             ]
     else:
+        if quality == "best":
+            fmt = "bestvideo+bestaudio/best"
+        else:
+            height = quality.replace("p", "")
+            fmt = (
+                f"bestvideo[height<={height}]+bestaudio/"
+                f"best[height<={height}]"
+            )
         if _HAS_FFMPEG:
-            opts["format"] = "bestvideo+bestaudio/best"
+            opts["format"] = fmt
             opts["merge_output_format"] = "mp4"
         else:
-            opts["format"] = "best[ext=mp4]/bestvideo[ext=mp4]+bestaudio[ext=m4a]/best"
+            opts["format"] = (
+                f"{fmt.split('/')[0]}[ext=mp4]+bestaudio[ext=m4a]"
+                f"/{fmt.split('/')[-1]}[ext=mp4]"
+            )
 
     return opts
 
@@ -152,12 +164,13 @@ def download_video(
     url: str,
     output_path: str = ".",
     quiet: bool = False,
+    quality: str = "best",
 ) -> str:
     if not is_valid_youtube_url(url):
         raise ValueError(f"Invalid YouTube URL: {url}")
 
     normalized_url = normalize_youtube_url(url)
-    opts = _get_ydl_opts(output_path=output_path, audio_only=False, quiet=quiet)
+    opts = _get_ydl_opts(output_path=output_path, audio_only=False, quiet=quiet, quality=quality)
 
     try:
         import yt_dlp

@@ -5,6 +5,7 @@ A Python YouTube video downloader that reverse-engineers YouTube's video deliver
 ## Features
 
 - Download videos from YouTube in the best available quality
+- Select a specific video resolution with `--quality` (480p, 720p, 1080p, or best)
 - Extract audio only (MP3 format)
 - Print video metadata without downloading (`--info`)
 - Supports all common YouTube URL formats: watch, shorts, embed, youtu.be
@@ -49,6 +50,14 @@ python -m ytdownloader --info "https://www.youtube.com/watch?v=dQw4w9WgXcQ"
 ```bash
 python -m ytdownloader --output ./downloads "https://www.youtube.com/watch?v=dQw4w9WgXcQ"
 ```
+
+### Download at a specific quality
+
+```bash
+python -m ytdownloader --quality 720p "https://www.youtube.com/watch?v=dQw4w9WgXcQ"
+```
+
+Supported quality values: `480p`, `720p`, `1080p`, or `best` (default). If the requested resolution is not available, yt-dlp falls back to the best available quality.
 
 ## Supported URL Formats
 

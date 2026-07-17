@@ -6,6 +6,7 @@ Usage:
     python -m ytdownloader --audio "https://www.youtube.com/watch?v=..."
     python -m ytdownloader --info "https://www.youtube.com/watch?v=..."
     python -m ytdownloader --output ./downloads "https://www.youtube.com/watch?v=..."
+    python -m ytdownloader --quality 720p "https://www.youtube.com/watch?v=..."
 """
 
 from __future__ import annotations
@@ -45,9 +46,14 @@ def main(args: list[str] | None = None) -> int:
         help="Output directory for downloaded files (default: current directory)",
     )
     parser.add_argument(
-        "--quiet",
+        "--quality",
         "-q",
-        action="store_true",
+        default="best",
+        choices=["best", "480p", "720p", "1080p"],
+        help="Video resolution to download (default: best)",
+    )
+    parser.add_argument(
+        "--quiet",
         default=False,
         help="Suppress progress output",
     )
@@ -76,7 +82,7 @@ def main(args: list[str] | None = None) -> int:
             print(f"Audio saved to: {output_path}")
         else:
             print(f"Downloading video from: {url}")
-            output_path = download_video(url, output_path=parsed.output, quiet=parsed.quiet)
+            output_path = download_video(url, output_path=parsed.output, quiet=parsed.quiet, quality=parsed.quality)
             print(f"Video saved to: {output_path}")
 
         return 0
