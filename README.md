@@ -64,7 +64,7 @@ python -m ytdownloader --output ./downloads "https://www.youtube.com/watch?v=dQw
 ytdownloader/
   __init__.py      - Package exports
   cli.py           - CLI entry point (argparse)
-  downloader.py    - Core download logic (yt-dlp wrapper)
+  downloader.py    - Core download logic (pure Python requests)
   metadata.py      - Metadata extraction from ytInitialPlayerResponse
   utils.py         - URL parsing and validation
 ```
@@ -73,7 +73,7 @@ ytdownloader/
 
 1. **URL Parsing** (`utils.py`): Validates and normalizes YouTube URLs, extracting the video ID.
 2. **Metadata Extraction** (`metadata.py`): Fetches the YouTube watch page HTML and extracts the embedded `ytInitialPlayerResponse` JSON object. This contains all video metadata, available formats, and stream URLs.
-3. **Download** (`downloader.py`): Uses `yt-dlp` to handle the complex format negotiation, stream URL resolution, and multi-format merging.
+3. **Download** (`downloader.py`): Uses pure Python `requests` to fetch and download streams directly, selecting the best available format.
 
 ## Error Handling
 
@@ -88,5 +88,4 @@ The tool handles common error scenarios gracefully:
 ## Requirements
 
 - Python 3.9+
-- yt-dlp
 - requests
