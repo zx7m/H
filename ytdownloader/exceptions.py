@@ -77,3 +77,7 @@ class ConfigError(YTDLException):
 
 class HtmlExtractionError(YTDLException):
     """Raised when extracting data from YouTube HTML fails."""
+
+
+class StreamDataError(YTDLException):
+    """Raised when parsing streaming data or stream format entries fails."""
