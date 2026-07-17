@@ -19,3 +19,7 @@ ytdownloader = "ytdownloader.cli:main"
 [tool.setuptools.packages.find]
 where = ["."]
 include = ["ytdownloader*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-v --tb=short"
