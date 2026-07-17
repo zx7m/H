@@ -1,0 +1,22 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ytdownloader"
+version = "1.0.0"
+description = "YouTube video downloader reverse-engineering YouTube's video delivery"
+readme = "README.md"
+requires-python = ">=3.9"
+license = {text = "MIT"}
+dependencies = [
+    "yt-dlp>=2024.1.0",
+    "requests>=2.28.0",
+]
+
+[project.scripts]
+ytdownloader = "ytdownloader.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["ytdownloader*"]
