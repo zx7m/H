@@ -171,19 +171,12 @@ class HttpClient:
         session.headers.update(headers)
 
         retry_policy = Retry(
-            total=self._config.max_retries,
-            backoff_factor=self._config.retry_delay_base,
-            status_forcelist=list(_RETRYABLE_STATUS_CODES),
-            allowed_methods={
-                _HTTP_METHOD_HEAD,
-                _HTTP_METHOD_GET,
-                _HTTP_METHOD_POST,
-                _HTTP_METHOD_PUT,
-                _HTTP_METHOD_DELETE,
-                _HTTP_METHOD_PATCH,
-            },
+            total=0,
+            backoff_factor=0,
+            status_forcelist=(),
+            allowed_methods=frozenset(),
             raise_on_status=False,
-            respect_retry_after_header=True,
+            respect_retry_after_header=False,
         )
 
         adapter = HTTPAdapter(max_retries=retry_policy, pool_connections=20, pool_maxsize=50)
@@ -238,7 +231,7 @@ class HttpClient:
         """Compute the sleep duration for a given retry attempt.
 
         Uses exponential backoff: ``retry_delay_base * (2 ** attempt)`` plus
-        a small random jitter (0-0.5 s) to avoid thundering-herd effects.
+        a small deterministic offset (``0.01 * attempt`` seconds).
 
         Args:
             attempt: The zero-based index of the current retry attempt.
@@ -384,7 +377,7 @@ class HttpClient:
                 response = self._session.get(
                     url,
                     params=params,
-                    headers=headers,
+                    headers=request_headers,
                     stream=stream,
                     timeout=effective_timeout,
                     allow_redirects=allow_redirects,
@@ -529,7 +522,7 @@ class HttpClient:
                     url,
                     data=data,
                     json=json,
-                    headers=headers,
+                    headers=request_headers,
                     timeout=effective_timeout,
                     allow_redirects=allow_redirects,
                 )
@@ -646,6 +639,8 @@ class HttpClient:
         """
         effective_timeout = timeout if timeout is not None else self._config.timeout
 
+        last_exception: Optional[Exception] = None
+
         for attempt in range(self._config.max_retries + 1):
             self._retry_stats["total_attempts"] += 1
             try:
@@ -661,7 +656,7 @@ class HttpClient:
 
                 response = self._session.head(
                     url,
-                    headers=headers,
+                    headers=request_headers,
                     timeout=effective_timeout,
                     allow_redirects=allow_redirects,
                 )
@@ -703,19 +698,37 @@ class HttpClient:
                 return validated
 
             except requests.exceptions.ConnectionError as exc:
+                last_exception = exc
+                self._logger.warning(
+                    "HEAD %s connection error (attempt %d/%d): %s",
+                    url,
+                    attempt + 1,
+                    self._config.max_retries + 1,
+                    exc,
+                )
                 if attempt < self._config.max_retries:
                     self._retry_stats["total_retries"] += 1
                     time.sleep(self._get_backoff_delay(attempt))
+                    continue
 
             except requests.exceptions.Timeout as exc:
+                last_exception = exc
+                self._logger.warning(
+                    "HEAD %s timeout (attempt %d/%d): %s",
+                    url,
+                    attempt + 1,
+                    self._config.max_retries + 1,
+                    exc,
+                )
                 if attempt < self._config.max_retries:
                     self._retry_stats["total_retries"] += 1
                     time.sleep(self._get_backoff_delay(attempt))
+                    continue
 
         self._retry_stats["failed_requests"] += 1
         raise NetworkError(
             f"HEAD {url} failed after {self._config.max_retries + 1} attempt(s)."
-        )
+        ) from last_exception
 
     # ------------------------------------------------------------------
     # Proxy
@@ -1222,10 +1235,11 @@ class HttpClient:
                 ) from exc
 
             finally:
-                try:
-                    response.close()
-                except Exception:  # pragma: no cover
-                    pass
+                if "response" in locals() and response is not None:
+                    try:
+                        response.close()
+                    except Exception:  # pragma: no cover
+                        pass
 
         if expected_size is not None and total_downloaded != expected_size:
             raise DownloadError(
