@@ -10,7 +10,6 @@ from __future__ import annotations
 
 import os
 import re
-import shutil
 import sys
 import time
 from typing import Any, Dict, List, Optional, Tuple
@@ -20,8 +19,6 @@ import requests
 from .metadata import MetadataExtractionError, get_video_info
 from .stream_resolver import StreamResolutionError, resolve_streams
 from .utils import extract_video_id, is_valid_youtube_url, normalize_youtube_url
-
-_HAS_FFMPEG = shutil.which("ffmpeg") is not None
 
 
 def _safe_int(value: Any) -> Optional[int]:
@@ -317,14 +314,17 @@ def download_video(
     url: str,
     output_path: str = ".",
     quiet: bool = False,
+    quality: str = "best",
 ) -> str:
-    """Download the best video stream for a YouTube URL.
+    """Download a video stream for a YouTube URL.
 
     Args:
         url: A valid YouTube watch/shorts/embed URL.
         output_path: Directory or file path for the output.  If a directory
             is given the file is named ``<title> [<id>].<ext>``.
         quiet: Suppress progress output when ``True``.
+        quality: Quality string such as ``'best'`` (default), ``'480p'``,
+            ``'720p'``, ``'1080p'``, etc.
 
     Returns:
         The path to the downloaded file.
@@ -349,7 +349,7 @@ def download_video(
             "No video streams found for this video. It may be unavailable."
         )
 
-    stream = select_format(video_streams, quality="best")
+    stream = select_format(video_streams, quality=quality)
     output_file = _build_output_filename(info, stream, output_path)
     stream_url = stream.get("url")
 
@@ -377,8 +377,8 @@ def download_audio(
     Args:
         url: A valid YouTube watch/shorts/embed URL.
         output_path: Directory or file path for the output.  If a directory
-            is given the file is named ``<title> [<id>].m4a`` (or ``.mp3``
-            when ffmpeg is available and conversion succeeds).
+            is given the file is named ``<title> [<id>].<ext>`` using the
+            native stream container.
         quiet: Suppress progress output when ``True``.
 
     Returns:
@@ -409,10 +409,6 @@ def download_audio(
 
     stream = select_format(audio_streams, quality="best")
     output_file = _build_output_filename(info, stream, output_path)
-
-    if _HAS_FFMPEG and not output_file.endswith(".mp3"):
-        output_file = os.path.splitext(output_file)[0] + ".mp3"
-
     stream_url = stream.get("url")
 
     if not stream_url:

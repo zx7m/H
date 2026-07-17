@@ -45,6 +45,12 @@ def main(args: list[str] | None = None) -> int:
         help="Output directory for downloaded files (default: current directory)",
     )
     parser.add_argument(
+        "--quality",
+        default="best",
+        choices=["best", "4320p", "2160p", "1440p", "1080p", "720p", "480p", "360p", "240p", "144p"],
+        help="Video quality to download (default: best)",
+    )
+    parser.add_argument(
         "--quiet",
         "-q",
         action="store_true",
@@ -76,7 +82,12 @@ def main(args: list[str] | None = None) -> int:
             print(f"Audio saved to: {output_path}")
         else:
             print(f"Downloading video from: {url}")
-            output_path = download_video(url, output_path=parsed.output, quiet=parsed.quiet)
+            output_path = download_video(
+                url,
+                output_path=parsed.output,
+                quiet=parsed.quiet,
+                quality=parsed.quality,
+            )
             print(f"Video saved to: {output_path}")
 
         return 0
