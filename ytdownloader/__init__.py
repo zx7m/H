@@ -3,10 +3,16 @@ ytdownloader - A YouTube video downloader that reverse-engineers
 YouTube's video delivery to extract and download video/audio streams.
 """
 
-from .downloader import download_video, download_audio, get_video_info
-from .utils import is_valid_youtube_url, extract_video_id
+from __future__ import annotations
 
 __version__ = "1.0.0"
+
+try:
+    from .downloader import download_video, download_audio, get_video_info
+    from .utils import is_valid_youtube_url, extract_video_id
+except ImportError:
+    pass
+
 __all__ = [
     "download_video",
     "download_audio",
