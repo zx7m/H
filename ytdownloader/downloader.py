@@ -1,18 +1,22 @@
 """
 Core download logic using pure Python requests for stream downloading.
 
-This module fetches video metadata via the existing metadata extraction pipeline
-and downloads the best available stream directly with requests, removing the
-yt-dlp dependency entirely.
+This module fetches video metadata and attempts to resolve stream URLs
+from both desktop and mobile YouTube page structures. It handles
+signatureCipher parsing (mobile) and serverAbrStreamingUrl (desktop),
+and downloads the best available stream directly with requests.
 """
 
 from __future__ import annotations
 
+import json
 import os
 import re
 import shutil
 import subprocess
 import sys
+import time
+import urllib.parse
 from typing import Any, Dict, List, Optional, Tuple
 
 import requests
@@ -22,7 +26,7 @@ from .utils import extract_video_id, is_valid_youtube_url, normalize_youtube_url
 
 _HAS_FFMPEG = shutil.which("ffmpeg") is not None
 
-_HEADERS = {
+_DESKTOP_HEADERS = {
     "User-Agent": (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
         "AppleWebKit/537.36 (KHTML, like Gecko) "
@@ -30,8 +34,57 @@ _HEADERS = {
     ),
     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
     "Accept-Language": "en-US,en;q=0.9",
+    "Accept-Encoding": "gzip, deflate, br",
     "Referer": "https://www.youtube.com/",
     "Origin": "https://www.youtube.com",
+    "Sec-Ch-Ua": '"Chromium";v="120", "Google Chrome";v="120", "Not=A?Brand";v="99"',
+    "Sec-Ch-Ua-Mobile": "?0",
+    "Sec-Ch-Ua-Platform": '"Windows"',
+    "Sec-Fetch-Dest": "document",
+    "Sec-Fetch-Mode": "navigate",
+    "Sec-Fetch-Site": "same-origin",
+    "Sec-Fetch-User": "?1",
+    "Upgrade-Insecure-Requests": "1",
+}
+
+_MOBILE_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Linux; Android 10; SM-G981B) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/120.0.0.0 Mobile Safari/537.36"
+    ),
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Accept-Language": "en-US,en;q=0.9",
+    "Accept-Encoding": "gzip, deflate, br",
+    "Referer": "https://www.youtube.com/",
+    "Origin": "https://www.youtube.com",
+    "Sec-Ch-Ua": '"Chromium";v="120", "Google Chrome";v="120", "Not=A?Brand";v="99"',
+    "Sec-Ch-Ua-Mobile": "?1",
+    "Sec-Ch-Ua-Platform": '"Android"',
+    "Sec-Fetch-Dest": "document",
+    "Sec-Fetch-Mode": "navigate",
+    "Sec-Fetch-Site": "same-origin",
+    "Sec-Fetch-User": "?1",
+    "Upgrade-Insecure-Requests": "1",
+}
+
+_STREAM_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Linux; Android 10; SM-G981B) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/120.0.0.0 Mobile Safari/537.36"
+    ),
+    "Accept": "*/*",
+    "Accept-Language": "en-US,en;q=0.9",
+    "Accept-Encoding": "identity",
+    "Referer": "https://www.youtube.com/watch",
+    "Origin": "https://www.youtube.com",
+    "Sec-Ch-Ua": '"Chromium";v="120", "Google Chrome";v="120", "Not=A?Brand";v="99"',
+    "Sec-Ch-Ua-Mobile": "?1",
+    "Sec-Ch-Ua-Platform": '"Android"',
+    "Sec-Fetch-Dest": "video",
+    "Sec-Fetch-Mode": "no-cors",
+    "Sec-Fetch-Site": "cross-site",
 }
 
 _FS_UNSAFE_RE = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
@@ -41,6 +94,20 @@ def _safe_filename(title: str, video_id: str, ext: str) -> str:
     clean_title = _FS_UNSAFE_RE.sub("_", title) if title else video_id
     clean_title = clean_title.strip(".")
     return f"{clean_title} [{video_id}].{ext}"
+
+
+def _parse_signature_cipher(cipher: str) -> Optional[str]:
+    try:
+        parsed = urllib.parse.parse_qs(cipher)
+        base_url = parsed.get("url", [None])[0]
+        sig = parsed.get("s", [None])[0]
+        sp = parsed.get("sp", ["sig"])[0]
+        if not base_url:
+            return None
+        sep = "&" if "?" in base_url else "?"
+        return f"{base_url}{sep}{sp}={sig}"
+    except Exception:
+        return None
 
 
 def _select_audio_format(
@@ -83,13 +150,25 @@ def _select_video_format(
     return None, False
 
 
-def _download_stream(url: str, dest: str, quiet: bool) -> None:
-    with requests.get(url, headers=_HEADERS, stream=True, timeout=30) as response:
+def _download_stream(
+    url: str,
+    dest: str,
+    quiet: bool = False,
+    session: Optional[requests.Session] = None,
+) -> None:
+    sess = session or requests.Session()
+    with sess.get(
+        url,
+        headers=_STREAM_HEADERS,
+        stream=True,
+        timeout=60,
+        allow_redirects=True,
+    ) as response:
         response.raise_for_status()
         total_str = response.headers.get("Content-Length", "0")
         try:
             total = int(total_str)
-        except ValueError:
+        except (ValueError, TypeError):
             total = 0
 
         downloaded = 0
@@ -204,6 +283,83 @@ def _format_size(content_length) -> str:
         return "unknown"
 
 
+def _resolve_stream_url(
+    url: str,
+    session: requests.Session,
+    quiet: bool = False,
+) -> Optional[str]:
+    normalized_url = normalize_youtube_url(url)
+    video_id = extract_video_id(normalized_url)
+    if not video_id:
+        if not quiet:
+            print("Error: Could not extract video ID from URL.", file=sys.stderr)
+        return None
+
+    # Try mobile first (has signatureCipher)
+    try:
+        resp = session.get(normalized_url, headers=_MOBILE_HEADERS, timeout=15)
+        resp.raise_for_status()
+        html = resp.text
+
+        match = re.search(r'var ytInitialPlayerResponse = ({.*?});\s*var ', html, re.DOTALL)
+        if not match:
+            match = re.search(r'ytInitialPlayerResponse = ({.*?});', html, re.DOTALL)
+
+        if match:
+            data = json.loads(match.group(1))
+            streaming_data = data.get("streamingData", {})
+            formats = streaming_data.get("formats", [])
+            adaptive = streaming_data.get("adaptiveFormats", [])
+
+            for fmt in formats + adaptive:
+                if fmt.get("signatureCipher"):
+                    resolved = _parse_signature_cipher(fmt["signatureCipher"])
+                    if resolved:
+                        if not quiet:
+                            print(f"Resolved stream URL from mobile page (itag {fmt.get('itag')})")
+                        return resolved
+    except Exception:
+        pass
+
+    # Try desktop page (has serverAbrStreamingUrl)
+    try:
+        resp = session.get(normalized_url, headers=_DESKTOP_HEADERS, timeout=15)
+        resp.raise_for_status()
+        html = resp.text
+
+        match = re.search(r'var ytInitialPlayerResponse = ({.*?});\s*var ', html, re.DOTALL)
+        if not match:
+            match = re.search(r'ytInitialPlayerResponse = ({.*?});', html, re.DOTALL)
+
+        if match:
+            data = json.loads(match.group(1))
+            streaming_data = data.get("streamingData", {})
+            server_url = streaming_data.get("serverAbrStreamingUrl")
+            if server_url:
+                if not quiet:
+                    print("Using serverAbrStreamingUrl (desktop)")
+                return server_url
+    except Exception:
+        pass
+
+    return None
+
+
+def _verify_stream(url: str, session: requests.Session, quiet: bool = False) -> bool:
+    try:
+        probe = session.head(url, headers=_STREAM_HEADERS, timeout=15, allow_redirects=True)
+        if probe.status_code == 200:
+            return True
+        if probe.status_code == 302:
+            return True
+        if not quiet:
+            print(f"Stream probe returned status {probe.status_code}", file=sys.stderr)
+    except Exception as exc:
+        if not quiet:
+            print(f"Stream probe failed: {exc}", file=sys.stderr)
+    return False
+
+
 def get_video_info_wrapper(url: str) -> Dict[str, Any]:
     if not is_valid_youtube_url(url):
         raise ValueError(
@@ -248,7 +404,12 @@ def download_video(
 
     stream_url = selected.get("url")
     if not stream_url:
-        raise ValueError("Selected format has no downloadable URL.")
+        if not quiet:
+            print("  Resolving stream URL...")
+        session = requests.Session()
+        stream_url = _resolve_stream_url(normalized_url, session, quiet=quiet)
+        if not stream_url:
+            raise ValueError("Could not resolve stream URL for this video.")
 
     video_id = info.get("id") or extract_video_id(url) or "unknown"
     title = info.get("title") or video_id
@@ -286,7 +447,12 @@ def download_audio(
 
     stream_url = selected.get("url")
     if not stream_url:
-        raise ValueError("Selected format has no downloadable URL.")
+        if not quiet:
+            print("  Resolving stream URL...")
+        session = requests.Session()
+        stream_url = _resolve_stream_url(normalized_url, session, quiet=quiet)
+        if not stream_url:
+            raise ValueError("Could not resolve stream URL for this video.")
 
     video_id = info.get("id") or extract_video_id(url) or "unknown"
     title = info.get("title") or video_id
