@@ -1,5 +1,4 @@
 """
-<<<<<<< HEAD
 Core download logic using pure Python requests for stream downloading.
 
 This module fetches video metadata via the existing metadata extraction pipeline
@@ -36,7 +35,6 @@ import os
 import re
 import shutil
 import subprocess
-<<<<<<< HEAD
 import sys
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -105,7 +103,6 @@ _HEADERS = {
     "Origin": "https://www.youtube.com",
 }
 
-<<<<<<< HEAD
 _FS_UNSAFE_RE = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
 
 
@@ -1029,7 +1026,6 @@ def download_video(
         raise InvalidURLError(f"Invalid YouTube URL: {url}")
 
     normalized_url = normalize_youtube_url(url)
-<<<<<<< HEAD
     info = get_video_info(normalized_url)
 
     formats = info.get("formats", [])
@@ -1046,6 +1042,8 @@ def download_video(
             "Warning: No progressive format available. "
             "Downloaded stream contains video only; audio is not included.",
             file=sys.stderr,
+        )
+
     logger.info("download_video called: url=%s, quality=%s, output=%s, resume=%s",
                 normalized_url, quality, output_path, resume)
 
@@ -1227,7 +1225,6 @@ def _download_stream_to_file(
             cause=exc if isinstance(exc, Exception) else None,
         ) from exc
 
-<<<<<<< HEAD
     stream_url = selected.get("url")
     if not stream_url:
         raise ValueError("Selected format has no downloadable URL.")
@@ -1276,7 +1273,6 @@ def download_audio(
         raise InvalidURLError(f"Invalid YouTube URL: {url}")
 
     normalized_url = normalize_youtube_url(url)
-<<<<<<< HEAD
     info = get_video_info(normalized_url)
 
     formats = info.get("formats", [])
