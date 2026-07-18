@@ -73,3 +73,7 @@ class CacheError(YTDLException):
 
 class ConfigError(YTDLException):
     """Raised when configuration loading, validation, or application fails."""
+
+
+class HtmlExtractionError(YTDLException):
+    """Raised when extracting data from YouTube HTML fails."""
