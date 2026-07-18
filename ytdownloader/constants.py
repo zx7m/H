@@ -8,7 +8,7 @@ for easy reference across the ytdownloader package.
 
 from __future__ import annotations
 
-from typing import Dict, List, Tuple
+from typing import Dict, List, Tuple, TypedDict
 
 
 # ---------------------------------------------------------------------------
@@ -1049,7 +1049,7 @@ PROGRESSIVE_ITAGS: List[int] = [
 #: Itags that contain video only (DASH/adaptive video).
 VIDEO_ONLY_ITAGS: List[int] = [
     242, 243, 244, 245, 246, 247, 248, 264, 266,
-    271, 272, 278, 302, 303, 308, 313, 315,
+    271, 272, 278, 313, 315,
     330, 331, 332, 333, 334, 335, 336, 337, 338,
     400, 401, 402, 403, 404, 405, 406,
     431, 432, 433, 434, 435, 436,
@@ -1085,7 +1085,18 @@ OUTPUT_TEMPLATE: str = "%(title)s [%(id)s].%(ext)s"
 # ---------------------------------------------------------------------------
 
 #: YouTube thumbnail sizes and their URLs.
-THUMBNAIL_SIZES: List[Dict[str, str]] = [
+
+
+class ThumbnailSize(TypedDict):
+    """Metadata for a single YouTube thumbnail variant."""
+
+    name: str
+    url: str
+    width: int
+    height: int
+
+
+THUMBNAIL_SIZES: List[ThumbnailSize] = [
     {"name": "default", "url": "https://i.ytimg.com/vi/{video_id}/default.jpg", "width": 120, "height": 90},
     {"name": "mqdefault", "url": "https://i.ytimg.com/vi/{video_id}/mqdefault.jpg", "width": 320, "height": 180},
     {"name": "hqdefault", "url": "https://i.ytimg.com/vi/{video_id}/hqdefault.jpg", "width": 480, "height": 360},
