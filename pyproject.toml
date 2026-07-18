@@ -4,15 +4,19 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "ytdownloader"
-version = "1.0.0"
-description = "YouTube video downloader reverse-engineering YouTube's video delivery"
+version = "2.0.0"
+description = "100% from-scratch YouTube video/audio downloader — no yt-dlp dependency"
 readme = "README.md"
 requires-python = ">=3.9"
 license = {text = "MIT"}
 dependencies = [
-    "yt-dlp>=2024.1.0",
     "requests>=2.28.0",
 ]
+
+[project.optional-dependencies]
+yaml = ["PyYAML>=5.4"]
+all = ["PyYAML>=5.4", "colorama>=0.4"]
+dev = ["PyYAML>=5.4", "colorama>=0.4", "pytest>=7.0"]
 
 [project.scripts]
 ytdownloader = "ytdownloader.cli:main"
